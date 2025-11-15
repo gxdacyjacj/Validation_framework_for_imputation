@@ -1,0 +1,1435 @@
+#%%
+"""
+validation_v2.py
+
+Framework for validating imputation methods under different missing-data
+mechanisms (MCAR, MAR, MNAR and paired variants) and different evaluation
+criteria (direct error, downstream task, and pattern-based validation).
+
+This script was originally developed for the experiments in the paper, so it
+contains:
+    1. missingness generators (MCAR / MAR / MNAR + paired versions)
+    2. a mixed-type imputer wrapper (handles numeric + categorical)
+    3. three validation criteria
+    4. an experiment runner that splits data into train/val/test
+
+To use it as a library:
+    - import the functions/classes you need
+    - provide your own pandas DataFrame X and target y
+    - call `generate_evaluation_results(...)`
+
+To reproduce the paper experiments, see the example in the
+`if __name__ == "__main__":` block at the end.
+"""
+
+import os
+
+# ---------------------------------------------------------------------------
+# Limit BLAS/OMP threads so that parallel evaluations don't oversubscribe.
+# This is helpful on HPC or when using joblib. Adjust/remove if not needed.
+# ---------------------------------------------------------------------------
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+# ---------------------------------------------------------------------------
+# Standard libraries
+# ---------------------------------------------------------------------------
+import re
+import pickle
+import warnings
+import random  # used in some earlier versions, can be removed if unused
+from typing import Dict, List, Tuple, Optional
+
+# ---------------------------------------------------------------------------
+# Third-party libraries
+# ---------------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.metrics import (
+    root_mean_squared_error,
+    accuracy_score,
+)
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+
+# models for downstream evaluation
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+
+# some imputers rely on this
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import SimpleImputer, KNNImputer, IterativeImputer
+
+# optional external libraries used in the original experiments
+from lightgbm import LGBMRegressor
+import miceforest as mf
+from catboost import CatBoostRegressor, CatBoostError
+
+# -----------------------------------------------------------------------------
+# Public API (exported symbols)
+# -----------------------------------------------------------------------------
+__all__ = [
+    # Missingness generators
+    "generate_MCAR",
+    "generate_MAR",
+    "generate_MNAR",
+    "generate_paired_missingness",
+    # Validators
+    "validate_baseline_direct_error",
+    "validate_proxy_complete_case",
+    "validate_downstream_performance",
+    # Imputers and wrappers
+    "MixedImputer",
+    "StandardizeBeforeImpute",
+    "wrap_imputers_with_standardize",
+    "build_imputers",
+    # Experiments
+    "run_one_dataset",
+    "split_train_val_test",
+    # Utilities (new)
+    "build_processed",
+    "flatten_results",
+]
+# ---------------------------------------------------------------------------
+# Default model list used in the paper (can be overridden by the user)
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_LIST = {
+    "Linear Regression": LinearRegression(),
+    "Random Forest": RandomForestRegressor(),
+    "SVM": SVR(),
+    "Neural Network": MLPRegressor(),
+}
+
+# ---------------------------------------------------------------------------
+# NOTE ABOUT DATA LOADING
+# ---------------------------------------------------------------------------
+# In the original version, UCI datasets were fetched immediately on import:
+#   from ucimlrepo import fetch_ucirepo
+#   ...
+# That makes the module less reusable and also requires internet.
+# For the GitHub version we move dataset fetching into __main__ so that
+# `import validation_v2` does NOT download anything.
+# ---------------------------------------------------------------------------
+# =============================================================================
+# Missingness Generators
+# =============================================================================
+"""
+The following functions implement the six masking procedures described in
+Section 2.3 of the paper *“Decision-Making Criteria on Choosing Appropriate
+Imputation Methods for Incomplete Dataset Prepared for Machine Learning”*.
+
+Each function generates artificial missingness under a specific mechanism or
+pattern, enabling controlled evaluation of imputation methods. Two levels of
+concepts are represented:
+
+1. **Mechanism** – governs *why* data become missing:
+       - MCAR  (Missing Completely at Random)
+       - MAR   (Missing At Random)
+       - MNAR  (Missing Not At Random)
+
+2. **Pattern** – governs *where* missingness occurs:
+       - Unstructured pattern: independent missing entries
+       - Structured pattern: paired or block-wise missingness
+
+All functions take both the raw (unencoded) dataset and the preprocessed
+(one-hot encoded) dataset as inputs so that missingness can be applied
+consistently across numerical and categorical variables.
+"""
+
+import re
+import numpy as np
+import scipy.special
+
+
+# -----------------------------------------------------------------------------
+# MCAR — Missing Completely at Random
+# -----------------------------------------------------------------------------
+def generate_MCAR(X, X_processed, missing_rate, independent_feature_idx=None):
+    """
+    Generate unstructured missingness under the MCAR mechanism.
+
+    Definition (Rubin, 1976):
+        The probability of a value being missing is independent of both
+        observed and unobserved data:  P(M | X_obs, X_mis) = P(M).
+
+    Implementation summary:
+        - A Bernoulli mask is sampled for each feature independently.
+        - For categorical variables (expanded by one-hot encoding),
+          all dummy columns of the same variable share the same mask
+          to preserve internal consistency.
+
+    Parameters
+    ----------
+    X : pandas.DataFrame
+        Original data before encoding.
+    X_processed : pandas.DataFrame
+        One-hot encoded version of X.
+    missing_rate : array-like of float
+        Target missing rate per original feature.
+    independent_feature_idx : any, optional
+        Not used in MCAR (kept for interface consistency).
+
+    Returns
+    -------
+    X_masked, Xp_masked, independent_feature_idx
+        DataFrames with NaNs inserted.
+    """
+    n_samples, n_features = X.shape
+    mask = np.zeros_like(X, dtype=bool)
+    mask_p = np.zeros_like(X_processed, dtype=bool)
+
+    for i, feat in enumerate(X.columns):
+        rate = missing_rate[i]
+
+        if X[feat].dtype == "object":  # categorical
+            pattern = re.compile(rf"^{re.escape(feat)}(_.+)?$")
+            cols = [c for c in X_processed.columns if pattern.match(c)]
+            idx = [X_processed.columns.get_loc(c) for c in cols]
+            feat_mask = np.random.random(n_samples) < rate
+            mask_p[:, idx] = feat_mask[:, None]
+            mask[:, i] = feat_mask
+        else:  # numeric
+            feat_mask = np.random.random(n_samples) < rate
+            idx = X_processed.columns.get_loc(feat)
+            mask_p[:, idx] = feat_mask
+            mask[:, i] = feat_mask
+
+    Xm = X.copy()
+    Xm[mask] = np.nan
+    Xpm = X_processed.copy()
+    Xpm[mask_p] = np.nan
+    return Xm.reset_index(drop=True), Xpm.reset_index(drop=True), independent_feature_idx
+
+
+# -----------------------------------------------------------------------------
+# MAR — Missing At Random  (FIXED: full independent_feature_idx & no self-picks)
+# -----------------------------------------------------------------------------
+def generate_MAR(X, X_processed, missing_rate, independent_feature_idx=None):
+    """
+    Generate unstructured missingness under the MAR mechanism.
+
+    Fixes:
+    - Build a full independent_feature_idx once (length = n_features).
+    - For every dependent feature i, choose a predictor j != i.
+    - If an index array is provided, use it as-is (must satisfy j != i).
+    - Return the complete independent_feature_idx actually used.
+
+    Implementation (unchanged otherwise):
+    - For each dependent feature i, derive missingness probability from its
+      predictor feature j via a scaled sigmoid, then rescale to match the
+      target missing rate for feature i.
+    - If the predictor is categorical (one-hot expanded in X_processed),
+      use a weighted combination of its dummy columns.
+    - For categorical dependents, mask all their dummy columns together.
+    """
+
+
+    n_samples, n_features = X.shape
+    if len(missing_rate) != n_features:
+        raise ValueError("Length of missing_rate must equal number of features.")
+
+    # ---- build or validate the dependency array (no self-picks) --------------
+    if independent_feature_idx is None:
+        indep_idx = np.empty(n_features, dtype=int)
+        for i in range(n_features):
+            # pick uniformly from all features except itself
+            choices = np.delete(np.arange(n_features), i)
+            indep_idx[i] = np.random.choice(choices)
+    else:
+        indep_idx = np.asarray(independent_feature_idx, dtype=int)
+        if indep_idx.shape[0] != n_features:
+            raise ValueError("independent_feature_idx must have length = n_features.")
+        # ensure no self-picks; if found, reassign randomly (excluding i)
+        for i in range(n_features):
+            if indep_idx[i] == i:
+                choices = np.delete(np.arange(n_features), i)
+                indep_idx[i] = np.random.choice(choices)
+
+    mask = np.zeros_like(X, dtype=bool)
+    mask_p = np.zeros_like(X_processed, dtype=bool)
+
+    for i in range(n_features):
+        dep_name = X.columns[i]
+        # columns in processed data for the DEPENDENT feature (to be masked)
+        if X[dep_name].dtype == "object":
+            pat_dep = re.compile(rf"^{re.escape(dep_name)}(_.+)?$")
+            dep_cols = [c for c in X_processed.columns if pat_dep.match(c)]
+            dep_idx_p = [X_processed.columns.get_loc(c) for c in dep_cols]
+        else:
+            dep_cols = [dep_name]
+            dep_idx_p = [X_processed.columns.get_loc(dep_name)]
+
+        # predictor (independent) feature j for this dependent i
+        j = int(indep_idx[i])
+        indep_name = X.columns[j]
+
+        # build predictor signal z in [0,1] (weighted dummies for categorical)
+        if X[indep_name].dtype == "object":
+            pat_ind = re.compile(rf"^{re.escape(indep_name)}(_.+)?$")
+            ind_cols = [c for c in X_processed.columns if pat_ind.match(c)]
+            ind_vals = X_processed.loc[:, ind_cols].to_numpy()
+            weights = np.random.random(len(ind_cols))
+            z = np.dot(ind_vals, weights)
+        else:
+            z = X[indep_name].to_numpy()
+
+        # normalise to [0,1] robustly
+        zmin, zmax = np.nanmin(z), np.nanmax(z)
+        if zmax - zmin == 0:
+            z_norm = np.full_like(z, 0.5, dtype=float)
+        else:
+            z_norm = (z - zmin) / (zmax - zmin)
+
+        # sigmoid, then rescale to target rate for feature i
+        probs = scipy.special.expit(4.0 * (z_norm - 0.5))
+        target = float(missing_rate[i])
+        mean_prob = probs.mean() if probs.size else 0.0
+        if mean_prob > 0:
+            probs = probs * (target / mean_prob)
+        probs = np.clip(probs, 0.0, 1.0)
+
+        feat_mask = (np.random.random(n_samples) < probs)
+        mask[:, i] = feat_mask
+        mask_p[:, dep_idx_p] = feat_mask[:, None]
+
+    Xm = X.copy()
+    Xm[mask] = np.nan
+    Xpm = X_processed.copy()
+    Xpm[mask_p] = np.nan
+
+    # Return the COMPLETE indep_idx so callers can reuse it for VAL/TEST/C1.2
+    return Xm.reset_index(drop=True), Xpm.reset_index(drop=True), indep_idx
+
+# -----------------------------------------------------------------------------
+# MNAR — Missing Not At Random
+# -----------------------------------------------------------------------------
+def generate_MNAR(X, X_processed, missing_rate, independent_feature_idx=None):
+    """
+    Generate unstructured missingness under the MNAR mechanism.
+
+    Definition:
+        The probability of missingness depends on the *unobserved* value itself:
+            P(M_j | X_obs, X_mis) = P(M_j | X_j).
+
+    Implementation summary:
+        - Each feature acts as its own predictor.
+        - Missingness probability is derived from the feature’s own values via
+          a scaled sigmoid transformation, as in Fig. 3.
+        - For categorical variables, all dummy columns are masked together.
+
+    Returns
+    -------
+    X_masked, Xp_masked, independent_feature_idx
+    """
+    n_samples, n_features = X.shape
+    if len(missing_rate) != n_features:
+        raise ValueError("Length of missing_rate must equal number of features.")
+    mask = np.zeros_like(X, dtype=bool)
+    mask_p = np.zeros_like(X_processed, dtype=bool)
+
+    for i, feat in enumerate(X.columns):
+        if X[feat].dtype == "object":
+            pat = re.compile(rf"^{re.escape(feat)}(_.+)?$")
+            cols = [c for c in X_processed.columns if pat.match(c)]
+            idx = [X_processed.columns.get_loc(c) for c in cols]
+            vals = X_processed.loc[:, cols].to_numpy()
+            weights = np.random.random(len(cols))
+            z = np.dot(vals, weights)
+        else:
+            idx = [X_processed.columns.get_loc(feat)]
+            z = X.iloc[:, i].to_numpy()
+
+        z = (z - z.min()) / (z.max() - z.min() + 1e-12)
+        probs = scipy.special.expit(4.0 * (z - 0.5))
+        probs *= missing_rate[i] / np.mean(probs)
+        probs = np.clip(probs, 0, 1)
+
+        feat_mask = np.random.random(n_samples) < probs
+        mask[:, i] = feat_mask
+        mask_p[:, idx] = feat_mask[:, None]
+
+    Xm = X.copy()
+    Xm[mask] = np.nan
+    Xpm = X_processed.copy()
+    Xpm[mask_p] = np.nan
+    return Xm.reset_index(drop=True), Xpm.reset_index(drop=True), independent_feature_idx
+
+
+# -----------------------------------------------------------------------------
+# Structured Pattern Generator (Pairwise Masking)
+# -----------------------------------------------------------------------------
+def generate_paired_missingness(
+    X,
+    Xm,
+    X_processed,
+    Xp_masked,
+    pair_feature_map=None,
+):
+    """
+    Generate structured-pattern missingness by imposing *pairwise* masking.
+
+    Definition (Section 2.3.2):
+        In structured-pattern mechanisms, missingness in one feature implies
+        missingness in related features. This reflects correlated experimental
+        tests where several measurements are jointly absent.
+
+    Implementation summary:
+        - Given an existing masked dataset (Xm, Xp_masked) generated under an
+          unstructured mechanism (MCAR/MAR/MNAR),
+          copy the missingness pattern from selected "source" features
+          to designated "paired" features.
+        - The mapping `pair_feature_map` defines which features depend on which.
+
+    Parameters
+    ----------
+    X, X_processed : pandas.DataFrame
+        Original and preprocessed data.
+    Xm, Xp_masked : pandas.DataFrame
+        Versions already containing unstructured missingness.
+    pair_feature_map : array-like or None
+        Length = n_features. If entry[i] = j, then feature i copies the mask
+        from feature j. If entry[i] is NaN, feature i retains its own mask.
+
+    Returns
+    -------
+    X_masked_pair, Xp_masked_pair
+    """
+    if pair_feature_map is None:
+        return Xm, Xp_masked
+
+    pair_feature_map = np.asarray(pair_feature_map)
+    old_mask = Xm.isna().to_numpy()
+    old_mask_p = Xp_masked.isna().to_numpy()
+    new_mask = np.zeros_like(old_mask)
+    new_mask_p = np.zeros_like(old_mask_p)
+
+    for i, feat in enumerate(X.columns):
+        if np.isnan(pair_feature_map[i]):
+            new_mask[:, i] = old_mask[:, i]
+            pat = re.compile(rf"^{re.escape(feat)}(_.+)?$")
+            idx = [X_processed.columns.get_loc(c) for c in X_processed.columns if pat.match(c)]
+            new_mask_p[:, idx] = old_mask_p[:, idx]
+            continue
+
+        dep_on = int(pair_feature_map[i])
+        new_mask[:, i] = old_mask[:, dep_on]
+
+        pat_i = re.compile(rf"^{re.escape(feat)}(_.+)?$")
+        idx_i = [X_processed.columns.get_loc(c) for c in X_processed.columns if pat_i.match(c)]
+        pat_j = re.compile(rf"^{re.escape(X.columns[dep_on])}(_.+)?$")
+        idx_j = [X_processed.columns.get_loc(c) for c in X_processed.columns if pat_j.match(c)]
+        new_mask_p[:, idx_i] = old_mask_p[:, idx_j[0]][:, None]
+
+    Xm_new = X.copy()
+    Xm_new[new_mask] = np.nan
+    Xp_new = X_processed.copy()
+    Xp_new[new_mask_p] = np.nan
+    return Xm_new.reset_index(drop=True), Xp_new.reset_index(drop=True)
+
+def build_processed(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a processed frame with numeric columns untouched and categorical
+    columns one-hot encoded. Works for:
+      - pure numeric datasets,
+      - pure categorical datasets,
+      - mixed.
+    """
+    num = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat = [c for c in X.columns if X[c].dtype == "object"]
+
+    if len(cat) == 0:
+        # pure numeric
+        return X[num].copy()
+
+    if len(num) == 0:
+        # pure categorical
+        return pd.get_dummies(
+            X[cat], prefix=cat, prefix_sep="_", dummy_na=False
+        )
+
+    # mixed: numeric + one-hot categoricals
+    Xp = pd.concat(
+        [
+            X[num].copy(),
+            pd.get_dummies(X[cat], prefix=cat, prefix_sep="_", dummy_na=False),
+        ],
+        axis=1,
+    )
+    return Xp
+#%%
+# =============================================================================
+# Validation Criteria (Sec. 2.2, Fig. 1)
+# =============================================================================
+"""
+This section implements the three validation criteria used in the paper:
+
+- Baseline criterion (Sec. 2.2.1): direct error vs hidden truth (test set).
+- Criterion 1 (Sec. 2.2.2): proxy error on a complete-case subset (validation).
+  * 1.1: MCAR proxy
+  * 1.2: mechanism-aligned proxy
+- Criterion 2 (Sec. 2.2.3): downstream task performance (validation).
+
+Conventions:
+- Numerical features are scored with RMSE (after Z-score normalisation).
+- Categorical features are scored with classification error = 1 - accuracy.
+- Final score per imputer is the mean across features present in the split.
+- For Criterion 2, the final score per imputer is the mean across models
+  (Linear Regression, Random Forest, SVM, MLP by default).
+"""
+
+# =============================================================================
+# Validation Criteria (detailed outputs preserved)
+# =============================================================================
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, accuracy_score
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+
+# --- helpers from before (reused) --------------------------------------------
+def _split_feature_types(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    cat_cols = [c for c in df.columns if df[c].dtype == "object"]
+    return num_cols, cat_cols
+
+def _zscore_fit(df: pd.DataFrame, cols: List[str]) -> Dict[str, Tuple[float, float]]:
+    stats = {}
+    for c in cols:
+        m = df[c].mean()
+        s = df[c].std(ddof=0) or 1.0
+        stats[c] = (m, s)
+    return stats
+
+def _zscore_apply(df: pd.DataFrame, stats: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
+    out = df.copy()
+    for c, (m, s) in stats.items():
+        out[c] = (out[c] - m) / s
+    return out
+
+def _compute_feature_error_numeric(y_true, y_pred) -> float:
+    return float(root_mean_squared_error(y_true, y_pred))
+
+def _compute_feature_error_categorical(y_true, y_pred) -> float:
+    return float(1.0 - accuracy_score(y_true, y_pred))
+
+def _errors_full_and_missing_only(
+    X_true: pd.DataFrame,
+    X_imp: pd.DataFrame,
+    X_masked: pd.DataFrame,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Return two dicts:
+      - per_feature_full:   error over all available rows (where both values exist)
+      - per_feature_missing_only: error computed only on rows that were masked as missing
+    """
+    num_cols, cat_cols = _split_feature_types(X_true)
+    per_feature_full, per_feature_missing = {}, {}
+
+    # numeric
+    for c in num_cols:
+        # full-column error (only where both values are available)
+        mask_full = X_true[c].notna() & X_imp[c].notna()
+        if mask_full.any():
+            per_feature_full[c] = _compute_feature_error_numeric(
+                X_true.loc[mask_full, c], X_imp.loc[mask_full, c]
+            )
+        # missing-only error (compare only positions originally masked)
+        mask_missing = X_masked[c].isna() & X_true[c].notna() & X_imp[c].notna()
+        if mask_missing.any():
+            per_feature_missing[c] = _compute_feature_error_numeric(
+                X_true.loc[mask_missing, c], X_imp.loc[mask_missing, c]
+            )
+
+    # categorical
+    for c in cat_cols:
+        mask_full = X_true[c].notna() & X_imp[c].notna()
+        if mask_full.any():
+            per_feature_full[c] = _compute_feature_error_categorical(
+                X_true.loc[mask_full, c], X_imp.loc[mask_full, c]
+            )
+        mask_missing = X_masked[c].isna() & X_true[c].notna() & X_imp[c].notna()
+        if mask_missing.any():
+            per_feature_missing[c] = _compute_feature_error_categorical(
+                X_true.loc[mask_missing, c], X_imp.loc[mask_missing, c]
+            )
+
+    return per_feature_full, per_feature_missing
+
+def _mean_or_nan(d: Dict[str, float]) -> float:
+    return float(np.mean(list(d.values()))) if d else np.nan
+
+
+def _detect_task_type(y: pd.Series) -> str:
+    if pd.api.types.is_numeric_dtype(y) and y.nunique() > 10:
+        return "regression"
+    return "classification"
+
+# -----------------------------------------------------------------------------
+# Baseline criterion — detailed per-feature outputs (full & missing-only)
+# -----------------------------------------------------------------------------
+def validate_baseline_direct_error(
+    *,
+    X_test_complete: pd.DataFrame,    # ground-truth test (fully observed)
+    X_test_masked: pd.DataFrame,      # test with introduced NaNs
+    imputer_dict: Dict[str, object],  # {name: sklearn-style imputer}
+    fit_data: Tuple[pd.DataFrame, pd.Series],  # (X_train, y_train) for fitting imputers
+) -> Dict[str, Dict[str, object]]:
+    """
+    Return per-imputer dict:
+      {
+        'per_feature_full':           {feature: error},
+        'per_feature_missing_only':   {feature: error},
+        'mean_full':                  float,
+        'mean_missing_only':          float
+      }
+    Numeric features are Z-scored using TRAIN statistics before error calc.
+    """
+    X_train, _ = fit_data
+    num_cols, _ = _split_feature_types(X_train)
+    zstats = _zscore_fit(X_train, num_cols)
+
+    out = {}
+    for name, imputer in imputer_dict.items():
+        # fit on train, transform masked test
+        X_imp = imputer.fit(X_train).transform(X_test_masked.copy())
+        X_imp = pd.DataFrame(X_imp, columns=X_test_masked.columns)
+
+        # Z-score numeric in both truth & imputed using train stats
+        X_true_std = X_test_complete.copy()
+        X_imp_std = X_imp.copy()
+        X_true_std[num_cols] = _zscore_apply(X_test_complete[num_cols], zstats)
+        X_imp_std[num_cols]  = _zscore_apply(X_imp[num_cols], zstats)
+
+        per_full, per_missing = _errors_full_and_missing_only(
+            X_true_std, X_imp_std, X_test_masked
+        )
+        out[name] = {
+            "per_feature_full": per_full,
+            "per_feature_missing_only": per_missing,
+            "mean_full": _mean_or_nan(per_full),
+            "mean_missing_only": _mean_or_nan(per_missing),
+        }
+    return out
+
+# -----------------------------------------------------------------------------
+# Criterion 1 — detailed per-feature outputs (full & missing-only)
+# -----------------------------------------------------------------------------
+def validate_proxy_complete_case(
+    *,
+    imputer_dict: Dict[str, object],
+    fit_data: Tuple[pd.DataFrame, pd.Series],  # (X_train, y_train)
+    prebuilt_complete_case: pd.DataFrame,
+    prebuilt_masked: pd.DataFrame,
+) -> Dict[str, Dict[str, object]]:
+    """
+    Criterion 1 (both 1.1 and 1.2), using prebuilt complete-case subset (Xcc)
+    and its masked counterpart (Xcc_masked).
+    Returns, per imputer:
+      {
+        'per_feature_full':           {feature: error},
+        'per_feature_missing_only':   {feature: error},
+        'mean_full':                  float,
+        'mean_missing_only':          float
+      }
+    """
+    Xcc = prebuilt_complete_case.copy()
+    Xcc_masked = prebuilt_masked.copy()
+
+    if Xcc.empty:
+        return {
+            name: {
+                "per_feature_full": {},
+                "per_feature_missing_only": {},
+                "mean_full": np.nan,
+                "mean_missing_only": np.nan,
+            }
+            for name in imputer_dict
+        }
+
+    X_train, _ = fit_data
+    num_cols, _ = _split_feature_types(X_train)
+    zstats = _zscore_fit(X_train, num_cols)
+
+    out = {}
+    for name, imputer in imputer_dict.items():
+        X_imp = imputer.fit(X_train).transform(Xcc_masked.copy())
+        X_imp = pd.DataFrame(X_imp, columns=Xcc_masked.columns)
+
+        # Z-score numeric using TRAIN stats
+        X_true_std = Xcc.copy()
+        X_imp_std = X_imp.copy()
+        X_true_std[num_cols] = _zscore_apply(Xcc[num_cols], zstats)
+        X_imp_std[num_cols]  = _zscore_apply(X_imp[num_cols], zstats)
+
+        per_full, per_missing = _errors_full_and_missing_only(
+            X_true_std, X_imp_std, Xcc_masked
+        )
+        out[name] = {
+            "per_feature_full": per_full,
+            "per_feature_missing_only": per_missing,
+            "mean_full": _mean_or_nan(per_full),
+            "mean_missing_only": _mean_or_nan(per_missing),
+        }
+    return out
+
+# -----------------------------------------------------------------------------
+# Criterion 2 — per-model errors preserved (plus mean)
+# -----------------------------------------------------------------------------
+def validate_downstream_performance(
+    *,
+    X_train_incomplete: pd.DataFrame,
+    y_train: pd.Series,
+    X_val_incomplete: pd.DataFrame,
+    y_val: pd.Series,
+    imputer_dict: Dict[str, object],
+    model_dict: Optional[Dict[str, object]] = None,
+) -> Dict[str, Dict[str, object]]:
+    """
+    Return per-imputer dict:
+      {
+        'per_model': {model_name: error},
+        'mean':      float
+      }
+    - For regression: RMSE on standardised y (fit stats on train).
+    - For classification: 1 - accuracy (expects classifiers in model_dict).
+    """
+    task = _detect_task_type(y_train)
+    models = model_dict or DEFAULT_MODEL_LIST
+
+    # Standardise y for regression (fit stats on train only).
+    if task == "regression":
+        y_mean, y_std = y_train.mean(), y_train.std(ddof=0) or 1.0
+        y_tr = (y_train - y_mean) / y_std
+        y_va = (y_val - y_mean) / y_std
+    else:
+        y_tr, y_va = y_train, y_val
+
+    out = {}
+    for imp_name, imputer in imputer_dict.items():
+        # Fit imputer on TRAIN, transform both TRAIN and VAL
+        Xtr_imp = imputer.fit_transform(X_train_incomplete.copy())
+        Xva_imp = imputer.transform(X_val_incomplete.copy())
+
+        # Ensure DataFrame type and column names preserved
+        Xtr_imp = pd.DataFrame(Xtr_imp, columns=X_train_incomplete.columns)
+        Xva_imp = pd.DataFrame(Xva_imp, columns=X_val_incomplete.columns)
+
+        # >>> IMPORTANT <<<: One-hot encode categoricals for downstream models
+        Xtr_num = build_processed(Xtr_imp)
+        Xva_num = build_processed(Xva_imp)
+
+        per_model = []
+        per_model_dict = {}
+
+        for mname, model in models.items():
+            # fresh instance
+            mdl = model.__class__(**getattr(model, "get_params", lambda: {})())
+            mdl.fit(Xtr_num, y_tr)
+
+            yhat = mdl.predict(Xva_num)
+            if task == "regression":
+                # RMSE on standardised y
+                err = float(np.sqrt(np.mean((np.asarray(y_va) - np.asarray(yhat)) ** 2)))
+            else:
+                if hasattr(mdl, "predict"):
+                    ypred = mdl.predict(Xva_num)
+                    err = float(1.0 - accuracy_score(y_va, ypred))
+                else:
+                    ypred = (yhat > np.median(yhat)).astype(y_va.dtype)
+                    err = float(1.0 - accuracy_score(y_va, ypred))
+
+            per_model_dict[mname] = err
+            per_model.append(err)
+
+        out[imp_name] = {
+            "per_model": per_model_dict,
+            "mean": float(np.mean(per_model)) if per_model else np.nan,
+        }
+
+    return out
+
+#%%
+# =============================================================================
+# MixedImputer: unified interface for numerical and categorical imputation
+# =============================================================================
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.impute import SimpleImputer, KNNImputer, IterativeImputer
+from sklearn.linear_model import BayesianRidge
+from sklearn.ensemble import RandomForestRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor, CatBoostError
+import pandas as pd
+import numpy as np
+import random
+
+# =============================================================================
+# Imputers & “standardise-before-impute” wrapper
+# =============================================================================
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class StandardizeBeforeImpute(BaseEstimator, TransformerMixin):
+    """
+    Wrap any sklearn-style imputer so that numeric features are Z-scored
+    *before* imputation and inverse-transformed afterward.
+
+    - Only numeric columns are standardised; categorical columns are passed as-is.
+    - Mean/Mode → unchanged in effect after inverse transform (mean becomes mean).
+    - KNN/PMM often benefit from scaling; tree/boosting models tolerate it.
+    - Returned DataFrame preserves original column names/order.
+    """
+    def __init__(self, base_imputer):
+        self.base_imputer = base_imputer
+        self.num_cols_ = None
+        self.cat_cols_ = None
+        self.zstats_ = None
+
+    def fit(self, X, y=None):
+        Xdf = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        self.num_cols_, self.cat_cols_ = _split_feature_types(Xdf)
+        # fit Z-stats on numeric only
+        self.zstats_ = _zscore_fit(Xdf, self.num_cols_)
+        # standardise a copy for imputer.fit
+        Xstd = Xdf.copy()
+        if self.num_cols_:
+            Xstd[self.num_cols_] = _zscore_apply(Xstd[self.num_cols_], self.zstats_)
+        self.base_imputer.fit(Xstd, y)
+        return self
+
+    def transform(self, X):
+        Xdf = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X, columns=self.num_cols_ + self.cat_cols_)
+        Xstd = Xdf.copy()
+        if self.num_cols_:
+            Xstd[self.num_cols_] = _zscore_apply(Xstd[self.num_cols_], self.zstats_)
+        Ximp = self.base_imputer.transform(Xstd)
+        Ximp = pd.DataFrame(Ximp, columns=Xdf.columns)
+        # inverse standardisation for numeric columns
+        if self.num_cols_:
+            out = Ximp.copy()
+            for c, (m, s) in self.zstats_.items():
+                out[c] = out[c] * s + m
+            return out
+        return Ximp
+
+def wrap_imputers_with_standardize(imputer_dict: Dict[str, object]) -> Dict[str, object]:
+    """
+    Return a new dict where every imputer is wrapped by StandardizeBeforeImpute.
+    Use this dict in the experiments so all imputations benefit from scaling.
+    """
+    return {name: StandardizeBeforeImpute(imp) for name, imp in imputer_dict.items()}
+
+class MixedImputer(BaseEstimator, TransformerMixin):
+    """
+    MixedImputer
+    ------------
+    A unified wrapper for imputing datasets containing both numerical and
+    categorical features, supporting multiple algorithms described in the
+    paper *“Decision-Making Criteria on Choosing Appropriate Imputation Methods
+    for Incomplete Dataset Prepared for Machine Learning”* (Sec. 2.4).
+
+    Each imputer instance can specify distinct strategies for numerical and
+    categorical variables, e.g. `"Mean_Mode"`, `"KNN_KNN"`, `"LGBM_LGBM"`, etc.
+
+    Supported method codes (case-insensitive):
+      • "Mean", "Median"     → univariate numeric replacements
+      • "Mode"               → univariate categorical replacement
+      • "Random"             → simple hot-deck (random donor)
+      • "KNN"                → k-Nearest Neighbour (scikit-learn KNNImputer)
+      • "PMM"                → Predictive Mean Matching via IterativeImputer
+      • "RF"                 → Random-Forest regressor in IterativeImputer
+      • "LGBM"               → LightGBM regressor in IterativeImputer
+      • "CB"                 → CatBoost regressor in IterativeImputer
+      • "Lin"                → Linear (BayesianRidge) model in IterativeImputer
+
+    Example
+    -------
+    >>> imp = MixedImputer(method="LGBM_LGBM", random_state=42)
+    >>> X_imp = imp.fit_transform(X)
+
+    Notes
+    -----
+    - All imputers are sklearn-style (fit/transform).
+    - For stochastic imputers (Random, PMM, etc.) reproducibility depends
+      on global or local random seed.
+    - For categorical columns, object dtype is expected.
+    """
+
+    def __init__(
+        self,
+        method: str = "Mean_Mode",
+        mice_iters: int = 10,
+        rf_n_estimators: int = 200,
+        knn_k: int = 5,
+        tree_jobs: int = 1,
+        random_state: int = 0,
+    ):
+        self.method = method
+        self.mice_iters = mice_iters
+        self.rf_n_estimators = rf_n_estimators
+        self.knn_k = knn_k
+        self.tree_jobs = tree_jobs
+        self.random_state = random_state
+        self.cat_dummy_cols_ = None
+
+    # -------------------------------------------------------------------------
+    # internal helpers
+    # -------------------------------------------------------------------------
+    def _split_features(self, X: pd.DataFrame):
+        num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+        cat_cols = [c for c in X.columns if X[c].dtype == "object"]
+        return num_cols, cat_cols
+
+    def _fit_numeric_imputer(self, X: pd.DataFrame):
+        """Return fitted numeric imputer based on selected method."""
+        num_method = self.method.split("_")[0].upper()
+
+        if num_method == "MEAN":
+            imp = SimpleImputer(strategy="mean")
+        elif num_method == "MEDIAN":
+            imp = SimpleImputer(strategy="median")
+        elif num_method == "RANDOM":
+            imp = SimpleImputer(strategy="constant", fill_value=np.nan)  # placeholder
+        elif num_method == "KNN":
+            imp = KNNImputer(n_neighbors=self.knn_k)
+        elif num_method == "PMM":
+            imp = IterativeImputer(
+                estimator=BayesianRidge(),
+                max_iter=self.mice_iters,
+                sample_posterior=True,
+                random_state=self.random_state,
+            )
+        elif num_method == "RF":
+            imp = IterativeImputer(
+                estimator=RandomForestRegressor(
+                    n_estimators=self.rf_n_estimators,
+                    n_jobs=self.tree_jobs,
+                    random_state=self.random_state,
+                ),
+                max_iter=self.mice_iters,
+                random_state=self.random_state,
+            )
+        elif num_method == "LGBM":
+            imp = IterativeImputer(
+                estimator=LGBMRegressor(
+                    n_estimators=self.rf_n_estimators,
+                    n_jobs=self.tree_jobs,
+                    random_state=self.random_state,
+                ),
+                max_iter=self.mice_iters,
+                random_state=self.random_state,
+            )
+        elif num_method == "CB":
+            try:
+                estimator = CatBoostRegressor(
+                    iterations=self.rf_n_estimators,
+                    verbose=False,
+                    random_seed=self.random_state,
+                )
+            except CatBoostError:
+                estimator = RandomForestRegressor(random_state=self.random_state)
+            imp = IterativeImputer(
+                estimator=estimator,
+                max_iter=self.mice_iters,
+                random_state=self.random_state,
+            )
+        elif num_method == "LIN":
+            imp = IterativeImputer(
+                estimator=BayesianRidge(),
+                max_iter=self.mice_iters,
+                random_state=self.random_state,
+            )
+        else:
+            raise ValueError(f"Unknown numeric imputation method: {num_method}")
+
+        imp.fit(X)
+        return imp, num_method
+
+    def _fit_categorical_imputer(self, X: pd.DataFrame):
+        """Return fitted categorical imputer based on selected method."""
+        cat_method = self.method.split("_")[-1].upper()
+
+        if cat_method in ("MODE", "MEAN"):
+            imp = SimpleImputer(strategy="most_frequent")
+        elif cat_method == "RANDOM":
+            imp = None  # handled manually
+        else:
+            # For categorical side we reuse numeric imputers that can handle 0/1 dummies
+            imp = self._fit_numeric_imputer(pd.get_dummies(X))[0]
+        return imp, cat_method
+
+    # -------------------------------------------------------------------------
+    # sklearn API
+    # -------------------------------------------------------------------------
+    def fit(self, X: pd.DataFrame, y=None):
+        X = X.copy()
+        self.num_cols_, self.cat_cols_ = self._split_features(X)
+
+        if self.num_cols_:
+            self.num_imputer_, self.num_method_ = self._fit_numeric_imputer(X[self.num_cols_])
+        else:
+            self.num_imputer_, self.num_method_ = None, None
+
+        if self.cat_cols_:
+            self.cat_imputer_, self.cat_method_ = self._fit_categorical_imputer(X[self.cat_cols_])
+            # NEW: remember dummy columns for iterative / KNN-type categorical imputers
+            if self.cat_method_ not in ("RANDOM", "MODE", "MEAN"):
+                X_dummy = pd.get_dummies(X[self.cat_cols_])
+                self.cat_dummy_cols_ = list(X_dummy.columns)
+            else:
+                self.cat_dummy_cols_ = None
+        else:
+            self.cat_imputer_, self.cat_method_ = None, None
+            self.cat_dummy_cols_ = None
+
+        return self
+
+    def transform(self, X: pd.DataFrame):
+        X = X.copy()
+        # numeric
+        if self.num_cols_ and self.num_imputer_:
+            if self.num_method_ == "RANDOM":
+                for c in self.num_cols_:
+                    na_mask = X[c].isna()
+                    if na_mask.any():
+                        observed = X.loc[~na_mask, c]
+                        X.loc[na_mask, c] = np.random.choice(observed, na_mask.sum(), replace=True)
+            else:
+                X[self.num_cols_] = self.num_imputer_.transform(X[self.num_cols_])
+
+        # categorical
+        if self.cat_cols_:
+            if self.cat_method_ == "RANDOM":
+                for c in self.cat_cols_:
+                    na_mask = X[c].isna()
+                    if na_mask.any():
+                        observed = X.loc[~na_mask, c]
+                        X.loc[na_mask, c] = np.random.choice(
+                            list(observed), size=na_mask.sum(), replace=True
+                        ) if len(observed) else np.nan
+            elif self.cat_method_ in ("MODE", "MEAN"):
+                imp = SimpleImputer(strategy="most_frequent")
+                X[self.cat_cols_] = imp.fit_transform(X[self.cat_cols_])
+            else:
+                # use fitted iterative-style imputer on dummy-coded columns
+                X_dummy = pd.get_dummies(X[self.cat_cols_])
+
+                # NEW: align dummy columns to those seen at fit time
+                if getattr(self, "cat_dummy_cols_", None) is not None:
+                    # add any missing columns with zeros
+                    for col in self.cat_dummy_cols_:
+                        if col not in X_dummy.columns:
+                            X_dummy[col] = 0.0
+                    # drop unexpected columns and reorder
+                    X_dummy = X_dummy[self.cat_dummy_cols_]
+
+                X_imp_dummy = self.cat_imputer_.transform(X_dummy)
+                X_imp_dummy = pd.DataFrame(X_imp_dummy, columns=X_dummy.columns)
+
+                # --- Robust decode back to labels (handles ties / all-zero rows) ---
+                for c in self.cat_cols_:
+                    cat_cols = [col for col in X_imp_dummy.columns if col.startswith(c + "_")]
+                    if not cat_cols:
+                        continue
+                    block = X_imp_dummy[cat_cols].copy()
+
+                    # Find rows that are degenerate: all zeros OR multi-way ties at max
+                    maxvals = block.max(axis=1)
+                    tie_mask = (block.eq(maxvals, axis=0).sum(axis=1) > 1) | (maxvals == 0)
+
+                    if tie_mask.any():
+                        # Fallback: choose the most “dominant” dummy column overall
+                        fallback_col = block.mean().idxmax()
+                        block.loc[tie_mask, :] = 0.0
+                        block.loc[tie_mask, fallback_col] = 1.0
+
+                    # Argmax decode to a single valid category
+                    X[c] = block.idxmax(axis=1).str.replace(c + "_", "", regex=False)
+        return X
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+# =============================================================================
+# Imputer factory for paper experiments
+# =============================================================================
+def build_imputers(
+    *,
+    mice_iters: int = 10,
+    rf_n_estimators: int = 200,
+    knn_k: int = 5,
+    tree_jobs: int = 1,
+    random_state: int = 0,
+    wrap_with_standardize: bool = True,
+) -> Dict[str, object]:
+    """
+    Return the six imputers used in the paper, built from the project's MixedImputer.
+
+    Notes on method codes (kept consistent with your MixedImputer):
+      - Univariate: "Mean", "Median", "Random" (hot-deck)
+      - Multivariate (via IterativeImputer): "KNN", "PMM", "Lin", "RF", "LGBM", "CB"
+      - MixedImputer expects "<num>_<cat>", so we mirror the same for both types.
+
+    Returned keys (exact, stable names):
+      "Mean/Mode", "Hot-Deck", "KNN", "LightGBM", "CatBoost", "PMM"
+    """
+    # 1) raw imputers using your MixedImputer
+    imps = {
+        "Mean/Mode": MixedImputer(
+            method="Mean_Mode",
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+        "Hot-Deck": MixedImputer(
+            method="Random_Random",   # your 'Random' = donor (hot-deck) per feature
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+        "KNN": MixedImputer(
+            method="KNN_KNN",         # KNNImputer inside your MixedImputer
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+        "LightGBM": MixedImputer(
+            method="LGBM_LGBM",       # IterativeImputer(est=LGBMRegressor)
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+        "CatBoost": MixedImputer(
+            method="CB_CB",           # IterativeImputer(est=CatBoostRegressor)
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+        "PMM": MixedImputer(
+            method="PMM_PMM",         # IterativeImputer(est=BayesianRidge, sample_posterior=True)
+            mice_iters=mice_iters,
+            rf_n_estimators=rf_n_estimators,
+            knn_k=knn_k,
+            tree_jobs=tree_jobs,
+            random_state=random_state,
+        ),
+    }
+
+    if not wrap_with_standardize:
+        return imps
+
+    # 2) apply "standardise-before-impute" wrapper globally (as you requested)
+    return wrap_imputers_with_standardize(imps)
+#%%
+# =============================================================================
+# Experiments (splits, seeding, runners)
+# =============================================================================
+from typing import Dict, List, Literal, Optional, Tuple
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+# ---------- seeding -----------------------------------------------------------
+BASE_SEED = 42
+
+def set_random_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+
+# ---------- splits ------------------------------------------------------------
+def split_train_val_test(
+    X: pd.DataFrame, y: Optional[pd.Series] = None, *, test_size: float = 0.2, val_size: float = 0.2, random_state: int = 0
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    """
+    3:1:1 split (train:val:test = 0.6:0.2:0.2 by default).
+    We first carve out TEST, then split remaining into TRAIN/VAL.
+    """
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+    rel_val = val_size / (1.0 - test_size)  # fraction of the remainder
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=rel_val, random_state=random_state + 17
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+# ---------- mask config -------------------------------------------------------
+MaskName = Literal["MCAR", "MAR", "MNAR", "MCAR_pair", "MAR_pair", "MNAR_pair"]
+
+def _unstructured_mask_fn(name: MaskName):
+    if name in ("MCAR", "MCAR_pair"):
+        return generate_MCAR
+    if name in ("MAR", "MAR_pair"):
+        return generate_MAR
+    if name in ("MNAR", "MNAR_pair"):
+        return generate_MNAR
+    raise ValueError(f"Unknown mask name: {name}")
+
+def _is_paired(name: MaskName) -> bool:
+    return name.endswith("_pair")
+
+# ---------- main runner for one dataset --------------------------------------
+def run_one_dataset(
+    *,
+    X: pd.DataFrame,
+    y: Optional[pd.Series],
+    mask_names: List[MaskName],
+    missing_rates: List[float],
+    n_repeats: int,
+    imputer_dict: Dict[str, object],
+    use_standardize_before_impute: bool = True,
+    model_dict: Optional[Dict[str, object]] = None,
+) -> Dict:
+    """
+    Execute the full evaluation on a single dataset across:
+      - mask_names: any of ["MCAR","MAR","MNAR","MCAR_pair","MAR_pair","MNAR_pair"]
+      - missing_rates: e.g., [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+      - n_repeats: e.g., 100
+
+    Returns a nested dict:
+      results[mask_name][rate][rep] = {
+        'baseline': <detailed baseline output>,
+        'criterion1_mcar': <detailed C1.1 output>,
+        'criterion1_mechanism': <detailed C1.2 output>,
+        'criterion2': <detailed C2 output>
+      }
+    """
+    # choose imputers (optionally wrap with standardise-before-impute)
+    imputers = wrap_imputers_with_standardize(imputer_dict) if use_standardize_before_impute else imputer_dict
+
+    results = {}
+    for mask_name in mask_names:
+        results[mask_name] = {}
+        for rate in missing_rates:
+            results[mask_name][rate] = {}
+
+            for rep in range(n_repeats):
+                set_random_seed(BASE_SEED + rep)
+
+                # ---- split --------------------------------------------------
+                X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(
+                    X, y, test_size=0.2, val_size=0.2, random_state=BASE_SEED + rep
+                )
+
+                # ---- build missing-rate vector per original feature ----------
+                miss_vec = np.full(X.shape[1], rate, dtype=float)
+
+                # ---- generate unstructured missingness on TRAIN/VAL/TEST ----
+                gen = _unstructured_mask_fn(mask_name.replace("_pair", ""))
+
+
+                # Note: your generators expect both original and processed frames.
+                # If you also keep a processed version elsewhere, pass it here.
+                # For simplicity, we call generators with only original frames;
+                # adapt to your exact API if you use one-hot-expanded frames during masking.
+                Xm_train, Xpm_train, indep_idx = gen(
+                    X_train, build_processed(X_train), miss_vec, independent_feature_idx=None
+                )
+                Xm_val,   Xpm_val,   _ = gen(
+                    X_val, build_processed(X_val), miss_vec, independent_feature_idx=indep_idx
+                )
+                Xm_test,  Xpm_test,  _ = gen(
+                    X_test, build_processed(X_test), miss_vec, independent_feature_idx=indep_idx
+                )
+
+                # ---- apply "paired" pattern if requested --------------------
+                if _is_paired(mask_name):
+                    # Example mapping: second half copies random first-half features.
+                    nfeat = X_train.shape[1]
+                    half = max(1, nfeat // 2)
+                    pair_map = np.full(nfeat, np.nan)
+                    for i in range(half, nfeat):
+                        pair_map[i] = np.random.randint(0, half)
+
+                    Xm_train, Xpm_train = generate_paired_missingness(
+                        X_train, Xm_train, build_processed(X_train), Xpm_train, pair_map
+                    )
+                    Xm_val, Xpm_val = generate_paired_missingness(
+                        X_val, Xm_val, build_processed(X_val), Xpm_val, pair_map
+                    )
+                    Xm_test, Xpm_test = generate_paired_missingness(
+                        X_test, Xm_test, build_processed(X_test), Xpm_test, pair_map
+                    )
+
+                # ---- Baseline (test set; direct error vs truth) --------------
+                baseline_out = validate_baseline_direct_error(
+                    X_test_complete=X_test,
+                    X_test_masked=Xm_test,
+                    imputer_dict=imputers,
+                    fit_data=(X_train, y_train),
+                )
+
+                
+                # ---- Criterion 1.1 (MCAR proxy on VAL complete-case) ----------------
+                Xcc = Xm_val.dropna(axis=0, how="any")   # complete-case subset from *masked* VAL
+                if Xcc.shape[0] == 0:
+                    c11_out = {name: {
+                        "per_feature_full": {},
+                        "per_feature_missing_only": {},
+                        "mean_full": np.nan,
+                        "mean_missing_only": np.nan,
+                    } for name in imputers}
+                else:
+                    Xccp = build_processed(Xcc)
+                    Xm_cc, Xpm_cc, _ = generate_MCAR(
+                        Xcc, Xccp, miss_vec, independent_feature_idx=None
+                    )
+                    c11_out = validate_proxy_complete_case(
+                        imputer_dict=imputers,
+                        fit_data=(X_train, y_train),
+                        prebuilt_complete_case=Xcc,
+                        prebuilt_masked=Xm_cc,
+                    )
+
+                # ---- Criterion 1.2 (mechanism-aligned proxy on VAL) ---------
+                # Build the complete-case subset first
+                Xcc = Xm_val.dropna(axis=0, how="any")
+                if Xcc.shape[0] == 0:
+                    c12_out = {name: {
+                        "per_feature_full": {},
+                        "per_feature_missing_only": {},
+                        "mean_full": np.nan,
+                        "mean_missing_only": np.nan,
+                    } for name in imputers}
+                else:
+                    Xccp = build_processed(Xcc)
+                    # Use the SAME independent_feature_idx as the simulation
+                    Xm_cc, Xpm_cc, _ = gen(
+                        Xcc, Xccp, miss_vec, independent_feature_idx=indep_idx
+                    )
+                    # If the simulation used a paired pattern, apply the SAME pair_map
+                    if _is_paired(mask_name):
+                        Xm_cc, Xpm_cc = generate_paired_missingness(
+                            Xcc, Xm_cc, Xccp, Xpm_cc, pair_map
+                        )
+
+                    c12_out = validate_proxy_complete_case(
+                        imputer_dict=imputers,
+                        fit_data=(X_train, y_train),
+                        prebuilt_complete_case=Xcc,
+                        prebuilt_masked=Xm_cc,
+                    )
+
+                # ---- Criterion 2 (downstream on VAL) -------------------------
+                c2_out = validate_downstream_performance(
+                    X_train_incomplete=Xm_train,
+                    y_train=y_train if y_train is not None else pd.Series(np.zeros(len(X_train))),
+                    X_val_incomplete=Xm_val,
+                    y_val=y_val if y_val is not None else pd.Series(np.zeros(len(X_val))),
+                    imputer_dict=imputers,
+                    model_dict=model_dict,  # or None -> defaults
+                )
+
+                results[mask_name][rate][rep] = dict(
+                    baseline=baseline_out,
+                    criterion1_mcar=c11_out,
+                    criterion1_mechanism=c12_out,
+                    criterion2=c2_out,
+                )
+
+    return results
+#%%
+# -----------------------------------------------------------------------------
+# Utility: flatten nested results → long DataFrame
+# -----------------------------------------------------------------------------
+def flatten_results(results: dict) -> pd.DataFrame:
+    """
+    Convert nested 'run_one_dataset' results into a long-form DataFrame.
+
+    Output columns:
+      mask, rate, rep, criterion, scope, imputer, feature, error
+    """
+    rows = []
+    for mask_name, by_rate in results.items():
+        for rate, by_rep in by_rate.items():
+            for rep, blocks in by_rep.items():
+                # Baseline & Criterion 1.x: per-feature errors
+                for crit_key in ("baseline", "criterion1_mcar", "criterion1_mechanism"):
+                    crit = blocks.get(crit_key, {})
+                    for imp, d in crit.items():
+                        for scope in ("per_feature_full", "per_feature_missing_only"):
+                            feats = d.get(scope, {})
+                            for feat, err in feats.items():
+                                rows.append(
+                                    dict(
+                                        mask=mask_name,
+                                        rate=rate,
+                                        rep=rep,
+                                        criterion=crit_key,
+                                        scope=scope,
+                                        imputer=imp,
+                                        feature=feat,
+                                        error=float(err),
+                                    )
+                                )
+                # Criterion 2: per-model errors
+                c2 = blocks.get("criterion2", {})
+                for imp, d in c2.items():
+                    per_model = d.get("per_model", {})
+                    for model, err in per_model.items():
+                        rows.append(
+                            dict(
+                                mask=mask_name,
+                                rate=rate,
+                                rep=rep,
+                                criterion="criterion2",
+                                scope="per_model",
+                                imputer=imp,
+                                feature=model,
+                                error=float(err),
+                            )
+                        )
+    return pd.DataFrame(rows)
+#%%
+# ---------- example __main__ --------------------------------------------------
+if __name__ == "__main__":
+    # Example usage (replace with your real dataset + imputers)
+    # X, y = <load your DataFrame and target Series here>
+    # imputer_dict = <your six imputers: mean/mode, hot-deck, KNN, PMM, LGBM, CatBoost>
+
+    # mask_names = ["MCAR", "MAR", "MNAR", "MCAR_pair", "MAR_pair", "MNAR_pair"]
+    # rates = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    # res = run_one_dataset(
+    #     X=X,
+    #     y=y,
+    #     mask_names=mask_names,
+    #     missing_rates=rates,
+    #     n_repeats=100,
+    #     imputer_dict=wrap_imputers_with_standardize(imputer_dict),
+    #     use_standardize_before_impute=False,   # already wrapped above
+    # )
+    # # Save results for your figure scripts
+    # import pickle
+    # with open("results_dataset.pkl", "wb") as f:
+    #     pickle.dump(res, f)
+    pass
+#%%
+from ucimlrepo import fetch_ucirepo 
+  
+# fetch dataset 
+student_performance = fetch_ucirepo(id=320) 
+  
+# data (as pandas dataframes) 
+X = student_performance.data.features 
+y = student_performance.data.targets 
+# %%
