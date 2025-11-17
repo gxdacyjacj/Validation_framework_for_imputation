@@ -1192,7 +1192,7 @@ def _is_paired(name: MaskName) -> bool:
 def run_one_dataset(
     *,
     X: pd.DataFrame,
-    y: Optional[ppd.Series],
+    y: Optional[pd.Series],
     mask_names: List[MaskName],
     missing_rates: List[float],
     n_repeats: int,
