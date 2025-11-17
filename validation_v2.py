@@ -572,9 +572,12 @@ def _mean_or_nan(d: Dict[str, float]) -> float:
 
 
 def _detect_task_type(y: pd.Series) -> str:
-    if pd.api.types.is_numeric_dtype(y) and y.nunique() > 10:
-        return "regression"
-    return "classification"
+    """
+    For this study, all six benchmark datasets are treated as regression problems
+    """
+    if not pd.api.types.is_numeric_dtype(y):
+        return "classification"
+    return "regression"
 
 # -----------------------------------------------------------------------------
 # Baseline criterion — detailed per-feature outputs (full & missing-only)
@@ -1069,7 +1072,6 @@ def build_imputers(
     knn_k: int = 5,
     tree_jobs: int = 1,
     random_state: int = 0,
-    wrap_with_standardize: bool = True,
 ) -> Dict[str, object]:
     """
     Return the six imputers used in the paper, built from the project's MixedImputer.
@@ -1134,11 +1136,8 @@ def build_imputers(
         ),
     }
 
-    if not wrap_with_standardize:
-        return imps
+    return imps
 
-    # 2) apply "standardise-before-impute" wrapper globally (as you requested)
-    return wrap_imputers_with_standardize(imps)
 #%%
 # =============================================================================
 # Experiments (splits, seeding, runners)
@@ -1189,16 +1188,20 @@ def _is_paired(name: MaskName) -> bool:
     return name.endswith("_pair")
 
 # ---------- main runner for one dataset --------------------------------------
+# ---------- main runner for one dataset --------------------------------------
 def run_one_dataset(
     *,
     X: pd.DataFrame,
-    y: Optional[pd.Series],
+    y: Optional[ppd.Series],
     mask_names: List[MaskName],
     missing_rates: List[float],
     n_repeats: int,
     imputer_dict: Dict[str, object],
     use_standardize_before_impute: bool = True,
     model_dict: Optional[Dict[str, object]] = None,
+    checkpoint_dir: Optional[str] = None,
+    dataset_label: Optional[str] = None,
+    resume: bool = True,
 ) -> Dict:
     """
     Execute the full evaluation on a single dataset across:
@@ -1206,29 +1209,122 @@ def run_one_dataset(
       - missing_rates: e.g., [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
       - n_repeats: e.g., 100
 
-    Returns a nested dict:
-      results[mask_name][rate][rep] = {
-        'baseline': <detailed baseline output>,
-        'criterion1_mcar': <detailed C1.1 output>,
-        'criterion1_mechanism': <detailed C1.2 output>,
-        'criterion2': <detailed C2 output>
-      }
+    New behaviour (for long runs / HPC use):
+    ----------------------------------------
+    - If `checkpoint_dir` and `dataset_label` are given, the function will:
+        * after EVERY repetition, overwrite a checkpoint file
+          "ckpt_{dataset_label}.pkl" under checkpoint_dir
+          containing the partial results.
+        * also write a small text file
+          "progress_{dataset_label}.txt" with the latest
+          (mask, rate, rep / n_repeats) status.
+    - If `resume=True` and a checkpoint exists, it will:
+        * load existing results,
+        * skip any (mask, rate, rep) combinations that are already present,
+        * continue from the first missing combination.
+
+    Random seed logic:
+    ------------------
+    - Instead of using the same seed for all mask/rate at a given rep,
+      we now use a deterministic per-combination seed:
+          seed = BASE_SEED + 1000*rep + 10*mask_idx + rate_idx
+      where mask_idx and rate_idx are the indices in mask_names/missing_rates.
+    - This makes each (mask, rate, rep) fully reproducible and independent
+      of whether you pause/resume or change the order of execution.
     """
+
     # choose imputers (optionally wrap with standardise-before-impute)
     imputers = wrap_imputers_with_standardize(imputer_dict) if use_standardize_before_impute else imputer_dict
 
-    results = {}
+    # ---------------------------------------------------------------
+    # Set up checkpoint paths (if requested)
+    # ---------------------------------------------------------------
+    ckpt_path = None
+    progress_path = None
+    if checkpoint_dir is not None and dataset_label is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        ckpt_path = os.path.join(checkpoint_dir, f"ckpt_{dataset_label}.pkl")
+        progress_path = os.path.join(checkpoint_dir, f"progress_{dataset_label}.txt")
+
+    # ---------------------------------------------------------------
+    # Load previous partial results if resume=True and checkpoint exists
+    # ---------------------------------------------------------------
+    results: Dict = {}
+    if resume and ckpt_path is not None and os.path.exists(ckpt_path):
+        try:
+            with open(ckpt_path, "rb") as f:
+                saved = pickle.load(f)
+            results = saved.get("results", {})
+            print(f"[run_one_dataset] Resuming from checkpoint: {ckpt_path}")
+        except Exception as e:
+            print(f"[run_one_dataset] Failed to load checkpoint ({e}), starting fresh.")
+            results = {}
+    else:
+        results = {}
+
+    # Helper: check whether a given (mask_name, rate, rep) is already done
+    def _already_done(mask_name, rate, rep) -> bool:
+        if mask_name not in results:
+            return False
+        if rate not in results[mask_name]:
+            return False
+        return rep in results[mask_name][rate]
+
+    # Helper: save checkpoint after each repetition
+    def _save_checkpoint():
+        if ckpt_path is None:
+            return
+        state = dict(
+            results=results,
+            mask_names=mask_names,
+            missing_rates=missing_rates,
+            n_repeats=n_repeats,
+        )
+        with open(ckpt_path, "wb") as f:
+            pickle.dump(state, f)
+
+    # Helper: update progress text file
+    def _update_progress(mask_name, rate, rep):
+        if progress_path is None:
+            return
+        msg = (
+            f"dataset={dataset_label} | "
+            f"mask={mask_name} | rate={rate:.2f} | rep={rep+1}/{n_repeats}\n"
+        )
+        try:
+            with open(progress_path, "w", encoding="utf-8") as f:
+                f.write(msg)
+        except OSError:
+            pass
+
+    # Precompute index lookups for deterministic per-combination seeds
+    mask_index = {name: i for i, name in enumerate(mask_names)}
+    rate_index = {r: i for i, r in enumerate(missing_rates)}
+
+    # ---------------------------------------------------------------
+    # Main loops
+    # ---------------------------------------------------------------
     for mask_name in mask_names:
-        results[mask_name] = {}
+        if mask_name not in results:
+            results[mask_name] = {}
         for rate in missing_rates:
-            results[mask_name][rate] = {}
+            if rate not in results[mask_name]:
+                results[mask_name][rate] = {}
 
             for rep in range(n_repeats):
-                set_random_seed(BASE_SEED + rep)
+                # Skip if already done in a previous run (checkpoint)
+                if _already_done(mask_name, rate, rep):
+                    continue
+
+                # Deterministic seed per (mask, rate, rep)
+                midx = mask_index[mask_name]
+                ridx = rate_index[rate]
+                combo_seed = BASE_SEED + 1000 * rep + 10 * midx + ridx
+                set_random_seed(combo_seed)
 
                 # ---- split --------------------------------------------------
                 X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(
-                    X, y, test_size=0.2, val_size=0.2, random_state=BASE_SEED + rep
+                    X, y, test_size=0.2, val_size=0.2, random_state=combo_seed
                 )
 
                 # ---- build missing-rate vector per original feature ----------
@@ -1237,11 +1333,6 @@ def run_one_dataset(
                 # ---- generate unstructured missingness on TRAIN/VAL/TEST ----
                 gen = _unstructured_mask_fn(mask_name.replace("_pair", ""))
 
-
-                # Note: your generators expect both original and processed frames.
-                # If you also keep a processed version elsewhere, pass it here.
-                # For simplicity, we call generators with only original frames;
-                # adapt to your exact API if you use one-hot-expanded frames during masking.
                 Xm_train, Xpm_train, indep_idx = gen(
                     X_train, build_processed(X_train), miss_vec, independent_feature_idx=None
                 )
@@ -1254,7 +1345,6 @@ def run_one_dataset(
 
                 # ---- apply "paired" pattern if requested --------------------
                 if _is_paired(mask_name):
-                    # Example mapping: second half copies random first-half features.
                     nfeat = X_train.shape[1]
                     half = max(1, nfeat // 2)
                     pair_map = np.full(nfeat, np.nan)
@@ -1279,16 +1369,18 @@ def run_one_dataset(
                     fit_data=(X_train, y_train),
                 )
 
-                
-                # ---- Criterion 1.1 (MCAR proxy on VAL complete-case) ----------------
+                # ---- Criterion 1.1 (MCAR proxy on VAL complete-case) --------
                 Xcc = Xm_val.dropna(axis=0, how="any")   # complete-case subset from *masked* VAL
                 if Xcc.shape[0] == 0:
-                    c11_out = {name: {
-                        "per_feature_full": {},
-                        "per_feature_missing_only": {},
-                        "mean_full": np.nan,
-                        "mean_missing_only": np.nan,
-                    } for name in imputers}
+                    c11_out = {
+                        name: {
+                            "per_feature_full": {},
+                            "per_feature_missing_only": {},
+                            "mean_full": np.nan,
+                            "mean_missing_only": np.nan,
+                        }
+                        for name in imputers
+                    }
                 else:
                     Xccp = build_processed(Xcc)
                     Xm_cc, Xpm_cc, _ = generate_MCAR(
@@ -1302,22 +1394,22 @@ def run_one_dataset(
                     )
 
                 # ---- Criterion 1.2 (mechanism-aligned proxy on VAL) ---------
-                # Build the complete-case subset first
                 Xcc = Xm_val.dropna(axis=0, how="any")
                 if Xcc.shape[0] == 0:
-                    c12_out = {name: {
-                        "per_feature_full": {},
-                        "per_feature_missing_only": {},
-                        "mean_full": np.nan,
-                        "mean_missing_only": np.nan,
-                    } for name in imputers}
+                    c12_out = {
+                        name: {
+                            "per_feature_full": {},
+                            "per_feature_missing_only": {},
+                            "mean_full": np.nan,
+                            "mean_missing_only": np.nan,
+                        }
+                        for name in imputers
+                    }
                 else:
                     Xccp = build_processed(Xcc)
-                    # Use the SAME independent_feature_idx as the simulation
                     Xm_cc, Xpm_cc, _ = gen(
                         Xcc, Xccp, miss_vec, independent_feature_idx=indep_idx
                     )
-                    # If the simulation used a paired pattern, apply the SAME pair_map
                     if _is_paired(mask_name):
                         Xm_cc, Xpm_cc = generate_paired_missingness(
                             Xcc, Xm_cc, Xccp, Xpm_cc, pair_map
@@ -1347,7 +1439,12 @@ def run_one_dataset(
                     criterion2=c2_out,
                 )
 
+                # Write progress + checkpoint at the END of each repetition
+                _update_progress(mask_name, rate, rep)
+                _save_checkpoint()
+
     return results
+
 #%%
 # -----------------------------------------------------------------------------
 # Utility: flatten nested results → long DataFrame
@@ -1423,13 +1520,4 @@ if __name__ == "__main__":
     # with open("results_dataset.pkl", "wb") as f:
     #     pickle.dump(res, f)
     pass
-#%%
-from ucimlrepo import fetch_ucirepo 
-  
-# fetch dataset 
-student_performance = fetch_ucirepo(id=320) 
-  
-# data (as pandas dataframes) 
-X = student_performance.data.features 
-y = student_performance.data.targets 
 # %%
