@@ -65,25 +65,7 @@ def run_block(
 ) -> str:
     """
     Core function to run a single (dataset, mask, rate) block.
-
-    Parameters
-    ----------
-    dataset_id : int
-        1=Concrete, 2=Composite, 3=Steel, 4=Energy, 5=Student, 6=Wine.
-    mask_name : str
-        One of VALID_MASK_NAMES.
-    rate : float
-        Missing rate, e.g. 0.05, 0.10, ..., 0.30.
-    n_repeats : int
-        Number of repetitions for this block.
-    out_root : str
-        Root folder for results; actual results go to:
-            out_root/<dataset_name>/...
-
-    Returns
-    -------
-    out_path : str
-        Path to the saved .pkl file for this block.
+    ...
     """
     # 1) Load datasets and pick the requested one
     X_list, y_list, names = load_all_datasets()
@@ -107,7 +89,7 @@ def run_block(
     imputers = build_imputers_for_block()
     print("        Imputers:", list(imputers.keys()))
 
-    # 3) Prepare output path: results/<dataset_name>/...
+    # 3) Prepare output + progress paths: results/<dataset_name>/...
     rate_str = f"{int(round(rate * 100))}pct"
     out_dir = os.path.join(out_root, safe_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -116,9 +98,30 @@ def run_block(
         out_dir,
         f"dataset{dataset_id}_{safe_name}_mask-{mask_name}_rate-{rate_str}.pkl",
     )
-    print(f"        Output -> {out_path}")
+    progress_path = os.path.join(
+        out_dir,
+        f"progress_mask-{mask_name}_rate-{rate_str}.txt",
+    )
 
-    # 4) Run run_one_dataset restricted to this single (mask, rate)
+    print(f"        Output   -> {out_path}")
+    print(f"        Progress -> {progress_path}")
+
+    # 4) Define per-repetition progress callback
+    def progress_callback(m_name, m_rate, rep_idx, total_reps):
+        # one-line status; overwrite file each time
+        msg = f"mask={m_name} | rate={m_rate:.2f} | rep={rep_idx}/{total_reps}\n"
+        try:
+            with open(progress_path, "w", encoding="utf-8") as f:
+                f.write(msg)
+        except OSError:
+            # Don't kill the job if updating the txt fails
+            pass
+
+        # Optional: also print occasionally to terminal
+        if rep_idx == 1 or rep_idx == total_reps or (rep_idx % 10 == 0):
+            print("        " + msg.strip())
+
+    # 5) Run run_one_dataset restricted to this single (mask, rate)
     t0 = time.time()
     res = v2.run_one_dataset(
         X=X,
@@ -128,11 +131,13 @@ def run_block(
         n_repeats=n_repeats,
         imputer_dict=imputers,
         use_standardize_before_impute=True,
-        model_dict=None,  # use DEFAULT_MODEL_LIST
+        model_dict=None,               # use DEFAULT_MODEL_LIST
+        # new: pass block-level progress callback
+        progress_callback=progress_callback,
     )
     elapsed = time.time() - t0
 
-    # 5) Save result
+    # 6) Save result
     payload = dict(
         dataset_id=dataset_id,
         dataset_name=ds_name,
@@ -146,7 +151,17 @@ def run_block(
 
     print(f"        Done in {elapsed/3600.0:.2f} hours.")
     print(f"        Saved to: {out_path}")
+
+    # Clean up progress file once this block is finished
+    try:
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
+    except OSError:
+        # If removal fails for some reason, just ignore it
+        pass
+
     return out_path
+
 
 
 # ---------------------------------------------------------------------

@@ -1202,7 +1202,9 @@ def run_one_dataset(
     checkpoint_dir: Optional[str] = None,
     dataset_label: Optional[str] = None,
     resume: bool = True,
+    progress_callback=None,
 ) -> Dict:
+
     """
     Execute the full evaluation on a single dataset across:
       - mask_names: any of ["MCAR","MAR","MNAR","MCAR_pair","MAR_pair","MNAR_pair"]
@@ -1439,7 +1441,12 @@ def run_one_dataset(
                     criterion2=c2_out,
                 )
 
-                # Write progress + checkpoint at the END of each repetition
+                # Optional external progress callback (e.g. per-block .txt)
+                if progress_callback is not None:
+                    # rep is 0-based internally; send 1..n_repeats for nicer display
+                    progress_callback(mask_name, rate, rep + 1, n_repeats)
+
+                # Internal dataset-level progress + checkpoint
                 _update_progress(mask_name, rate, rep)
                 _save_checkpoint()
 
