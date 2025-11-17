@@ -1,1 +1,1 @@
-mask=MCAR | rate=0.20 | rep=24/100
+mask=MCAR | rate=0.20 | rep=34/100

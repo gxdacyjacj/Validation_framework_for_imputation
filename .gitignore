@@ -1,3 +1,8 @@
+# Python cache
 __pycache__/
+
+# CatBoost output dir
 catboost_info/
-*.txt
+
+# Only ignore progress text files, not all .txt
+progress_*.txt
