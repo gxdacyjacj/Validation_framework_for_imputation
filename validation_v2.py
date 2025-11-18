@@ -855,17 +855,11 @@ class MixedImputer(BaseEstimator, TransformerMixin):
       • "CB"                 → CatBoost regressor in IterativeImputer
       • "Lin"                → Linear (BayesianRidge) model in IterativeImputer
 
-    Example
-    -------
-    >>> imp = MixedImputer(method="LGBM_LGBM", random_state=42)
-    >>> X_imp = imp.fit_transform(X)
-
     Notes
     -----
-    - All imputers are sklearn-style (fit/transform).
-    - For stochastic imputers (Random, PMM, etc.) reproducibility depends
-      on global or local random seed.
-    - For categorical columns, object dtype is expected.
+    - For "Random" (hot-deck), if a column becomes fully missing in the
+      current subset, we fall back to donors taken from the TRAIN data
+      at fit time (stored in numeric_fallback_ / categorical_fallback_).
     """
 
     def __init__(
@@ -883,7 +877,19 @@ class MixedImputer(BaseEstimator, TransformerMixin):
         self.knn_k = knn_k
         self.tree_jobs = tree_jobs
         self.random_state = random_state
+
+        # attributes initialised in fit
+        self.num_cols_ = None
+        self.cat_cols_ = None
+        self.num_imputer_ = None
+        self.num_method_ = None
+        self.cat_imputer_ = None
+        self.cat_method_ = None
         self.cat_dummy_cols_ = None
+
+        # fallback donor pools (from TRAIN data)
+        self.numeric_fallback_ = {}
+        self.categorical_fallback_ = {}
 
     # -------------------------------------------------------------------------
     # internal helpers
@@ -902,7 +908,8 @@ class MixedImputer(BaseEstimator, TransformerMixin):
         elif num_method == "MEDIAN":
             imp = SimpleImputer(strategy="median")
         elif num_method == "RANDOM":
-            imp = SimpleImputer(strategy="constant", fill_value=np.nan)  # placeholder
+            # placeholder; we handle RANDOM manually in transform
+            imp = SimpleImputer(strategy="constant", fill_value=np.nan)
         elif num_method == "KNN":
             imp = KNNImputer(n_neighbors=self.knn_k)
         elif num_method == "PMM":
@@ -965,10 +972,11 @@ class MixedImputer(BaseEstimator, TransformerMixin):
         if cat_method in ("MODE", "MEAN"):
             imp = SimpleImputer(strategy="most_frequent")
         elif cat_method == "RANDOM":
-            imp = None  # handled manually
+            imp = None  # handled manually in transform
         else:
-            # For categorical side we reuse numeric imputers that can handle 0/1 dummies
-            imp = self._fit_numeric_imputer(pd.get_dummies(X))[0]
+            # reuse numeric-style imputers on dummies
+            X_dummy = pd.get_dummies(X)
+            imp, _ = self._fit_numeric_imputer(X_dummy)
         return imp, cat_method
 
     # -------------------------------------------------------------------------
@@ -978,6 +986,20 @@ class MixedImputer(BaseEstimator, TransformerMixin):
         X = X.copy()
         self.num_cols_, self.cat_cols_ = self._split_features(X)
 
+        # (re)initialise fallback donor pools
+        self.numeric_fallback_ = {}
+        self.categorical_fallback_ = {}
+
+        for c in self.num_cols_:
+            vals = X[c].dropna().values
+            if vals.size > 0:
+                self.numeric_fallback_[c] = vals
+
+        for c in self.cat_cols_:
+            vals = X[c].dropna().values
+            if vals.size > 0:
+                self.categorical_fallback_[c] = vals
+
         if self.num_cols_:
             self.num_imputer_, self.num_method_ = self._fit_numeric_imputer(X[self.num_cols_])
         else:
@@ -985,7 +1007,6 @@ class MixedImputer(BaseEstimator, TransformerMixin):
 
         if self.cat_cols_:
             self.cat_imputer_, self.cat_method_ = self._fit_categorical_imputer(X[self.cat_cols_])
-            # NEW: remember dummy columns for iterative / KNN-type categorical imputers
             if self.cat_method_ not in ("RANDOM", "MODE", "MEAN"):
                 X_dummy = pd.get_dummies(X[self.cat_cols_])
                 self.cat_dummy_cols_ = list(X_dummy.columns)
@@ -999,69 +1020,93 @@ class MixedImputer(BaseEstimator, TransformerMixin):
 
     def transform(self, X: pd.DataFrame):
         X = X.copy()
-        # numeric
+
+        # ----- numeric side ---------------------------------------------------
         if self.num_cols_ and self.num_imputer_:
             if self.num_method_ == "RANDOM":
                 for c in self.num_cols_:
                     na_mask = X[c].isna()
-                    if na_mask.any():
-                        observed = X.loc[~na_mask, c]
-                        X.loc[na_mask, c] = np.random.choice(observed, na_mask.sum(), replace=True)
+                    if not na_mask.any():
+                        continue  # nothing to impute
+
+                    # donors from current subset
+                    observed = X.loc[~na_mask, c].dropna().values
+
+                    # if no donors in this subset, fallback to TRAIN donors
+                    if observed.size == 0:
+                        observed = self.numeric_fallback_.get(c, None)
+                        if observed is None or len(observed) == 0:
+                            # no information at all; leave NaNs as-is
+                            continue
+
+                    X.loc[na_mask, c] = np.random.choice(
+                        observed,
+                        size=na_mask.sum(),
+                        replace=True,
+                    )
             else:
                 X[self.num_cols_] = self.num_imputer_.transform(X[self.num_cols_])
 
-        # categorical
+        # ----- categorical side ----------------------------------------------
         if self.cat_cols_:
             if self.cat_method_ == "RANDOM":
                 for c in self.cat_cols_:
                     na_mask = X[c].isna()
-                    if na_mask.any():
-                        observed = X.loc[~na_mask, c]
-                        X.loc[na_mask, c] = np.random.choice(
-                            list(observed), size=na_mask.sum(), replace=True
-                        ) if len(observed) else np.nan
+                    if not na_mask.any():
+                        continue
+
+                    observed = X.loc[~na_mask, c].dropna().values
+
+                    if observed.size == 0:
+                        observed = self.categorical_fallback_.get(c, None)
+                        if observed is None or len(observed) == 0:
+                            continue  # leave NaNs; no donors anywhere
+
+                    X.loc[na_mask, c] = np.random.choice(
+                        observed,
+                        size=na_mask.sum(),
+                        replace=True,
+                    )
             elif self.cat_method_ in ("MODE", "MEAN"):
-                imp = SimpleImputer(strategy="most_frequent")
-                X[self.cat_cols_] = imp.fit_transform(X[self.cat_cols_])
+                # use a fitted most_frequent imputer on TRAIN stats
+                # (self.cat_imputer_ was fit in _fit_categorical_imputer)
+                X[self.cat_cols_] = self.cat_imputer_.transform(X[self.cat_cols_])
             else:
                 # use fitted iterative-style imputer on dummy-coded columns
                 X_dummy = pd.get_dummies(X[self.cat_cols_])
 
-                # NEW: align dummy columns to those seen at fit time
+                # align dummy columns to those seen at fit time
                 if getattr(self, "cat_dummy_cols_", None) is not None:
-                    # add any missing columns with zeros
                     for col in self.cat_dummy_cols_:
                         if col not in X_dummy.columns:
                             X_dummy[col] = 0.0
-                    # drop unexpected columns and reorder
                     X_dummy = X_dummy[self.cat_dummy_cols_]
 
                 X_imp_dummy = self.cat_imputer_.transform(X_dummy)
                 X_imp_dummy = pd.DataFrame(X_imp_dummy, columns=X_dummy.columns)
 
-                # --- Robust decode back to labels (handles ties / all-zero rows) ---
+                # decode back to labels (robust to ties/all-zero)
                 for c in self.cat_cols_:
                     cat_cols = [col for col in X_imp_dummy.columns if col.startswith(c + "_")]
                     if not cat_cols:
                         continue
                     block = X_imp_dummy[cat_cols].copy()
 
-                    # Find rows that are degenerate: all zeros OR multi-way ties at max
                     maxvals = block.max(axis=1)
                     tie_mask = (block.eq(maxvals, axis=0).sum(axis=1) > 1) | (maxvals == 0)
 
                     if tie_mask.any():
-                        # Fallback: choose the most “dominant” dummy column overall
                         fallback_col = block.mean().idxmax()
                         block.loc[tie_mask, :] = 0.0
                         block.loc[tie_mask, fallback_col] = 1.0
 
-                    # Argmax decode to a single valid category
                     X[c] = block.idxmax(axis=1).str.replace(c + "_", "", regex=False)
+
         return X
 
     def fit_transform(self, X, y=None):
         return self.fit(X, y).transform(X)
+
 # =============================================================================
 # Imputer factory for paper experiments
 # =============================================================================
