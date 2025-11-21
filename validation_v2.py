@@ -737,10 +737,18 @@ def validate_downstream_performance(
         per_model_dict = {}
 
         for mname, model in models.items():
-            # fresh instance
+            # Fresh instance
             mdl = model.__class__(**getattr(model, "get_params", lambda: {})())
-            mdl.fit(Xtr_num, y_tr)
 
+            # --- NEW: skip models when train target is constant -----------------
+            # CatBoost (and some others) cannot handle y_train with a single value.
+            if isinstance(mdl, CatBoostRegressor) or isinstance(mdl, CatBoostClassifier):
+                if pd.Series(y_tr).nunique() <= 1:
+                    per_model[mname] = np.nan  # or 0.0, depending on how you want to treat it
+                    continue
+            # --------------------------------------------------------------------
+
+            mdl.fit(Xtr_num, y_tr)
             yhat = mdl.predict(Xva_num)
             if task == "regression":
                 # RMSE on standardised y
