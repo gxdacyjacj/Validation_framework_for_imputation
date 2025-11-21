@@ -690,6 +690,7 @@ def validate_proxy_complete_case(
 # -----------------------------------------------------------------------------
 # Criterion 2 — per-model errors preserved (plus mean)
 # -----------------------------------------------------------------------------
+
 def validate_downstream_performance(
     *,
     X_train_incomplete: pd.DataFrame,
@@ -729,9 +730,19 @@ def validate_downstream_performance(
         Xtr_imp = pd.DataFrame(Xtr_imp, columns=X_train_incomplete.columns)
         Xva_imp = pd.DataFrame(Xva_imp, columns=X_val_incomplete.columns)
 
-        # >>> IMPORTANT <<<: One-hot encode categoricals for downstream models
+        # One-hot encode categoricals for downstream models
         Xtr_num = build_processed(Xtr_imp)
         Xva_num = build_processed(Xva_imp)
+
+        # --- NEW: if y_train is (effectively) constant, downstream comparison
+        # is not meaningful; skip and return NaN for this imputer.
+        if pd.Series(y_tr).nunique() <= 1:
+            out[imp_name] = {
+                "per_model": {},
+                "mean": np.nan,
+            }
+            continue
+        # --------------------------------------------------------------------
 
         per_model = []
         per_model_dict = {}
@@ -740,16 +751,9 @@ def validate_downstream_performance(
             # Fresh instance
             mdl = model.__class__(**getattr(model, "get_params", lambda: {})())
 
-            # --- NEW: skip models when train target is constant -----------------
-            # CatBoost (and some others) cannot handle y_train with a single value.
-            if isinstance(mdl, CatBoostRegressor) or isinstance(mdl, CatBoostClassifier):
-                if pd.Series(y_tr).nunique() <= 1:
-                    per_model[mname] = np.nan  # or 0.0, depending on how you want to treat it
-                    continue
-            # --------------------------------------------------------------------
-
             mdl.fit(Xtr_num, y_tr)
             yhat = mdl.predict(Xva_num)
+
             if task == "regression":
                 # RMSE on standardised y
                 err = float(np.sqrt(np.mean((np.asarray(y_va) - np.asarray(yhat)) ** 2)))
@@ -770,6 +774,7 @@ def validate_downstream_performance(
         }
 
     return out
+
 
 #%%
 # =============================================================================
