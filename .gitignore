@@ -6,3 +6,5 @@ catboost_info/
 
 # Only ignore progress text files, not all .txt
 progress_*.txt
+
+
