@@ -790,6 +790,56 @@ import random
 # =============================================================================
 from sklearn.base import BaseEstimator, TransformerMixin
 
+class BaseImputer:
+    """
+    Simple interface that every imputer (internal or external) must follow:
+
+    - fit(X)
+    - transform(X)
+    - fit_transform(X)
+
+    This class allows external imputers (VAE/MIWAE/GAIN) to be plugged
+    into the framework without modifying MixedImputer.
+    """
+    def fit(self, X, y=None):
+        raise NotImplementedError
+
+    def transform(self, X):
+        raise NotImplementedError
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+    
+class ExternalImputer(BaseImputer):
+    """
+    Wraps any external imputation function into a sklearn-like object.
+    Users pass two callables:
+
+    - train_fn(X): trains a model and returns a model object
+    - impute_fn(model, X): returns imputed DataFrame
+
+    Example use:
+        def train_miwae(X): ...
+        def impute_miwae(model, X): ...
+
+        imputer = ExternalImputer("MIWAE", train_miwae, impute_miwae)
+    """
+
+    def __init__(self, name, train_fn, impute_fn):
+        self.name = name
+        self.train_fn = train_fn
+        self.impute_fn = impute_fn
+        self.model_ = None
+
+    def fit(self, X, y=None):
+        self.model_ = self.train_fn(X)
+        return self
+
+    def transform(self, X):
+        if self.model_ is None:
+            raise RuntimeError(f"ExternalImputer {self.name} not fitted yet.")
+        return self.impute_fn(self.model_, X)
+
 class StandardizeBeforeImpute(BaseEstimator, TransformerMixin):
     """
     Wrap any sklearn-style imputer so that numeric features are Z-scored
