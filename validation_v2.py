@@ -1003,14 +1003,13 @@ class MixedImputer(BaseEstimator, TransformerMixin):
                 random_state=self.random_state,
             )
         elif num_method == "CB":
-            try:
-                estimator = CatBoostRegressor(
-                    iterations=self.rf_n_estimators,
-                    verbose=False,
-                    random_seed=self.random_state,
-                )
-            except CatBoostError:
-                estimator = RandomForestRegressor(random_state=self.random_state)
+            # First attempt: CatBoostRegressor (no file writing, good for parallel runs)
+            estimator = CatBoostRegressor(
+                iterations=self.rf_n_estimators,
+                verbose=False,
+                random_seed=self.random_state,
+                allow_writing_files=False,
+            )
             imp = IterativeImputer(
                 estimator=estimator,
                 max_iter=self.mice_iters,
@@ -1025,7 +1024,29 @@ class MixedImputer(BaseEstimator, TransformerMixin):
         else:
             raise ValueError(f"Unknown numeric imputation method: {num_method}")
 
-        imp.fit(X)
+        try:
+            imp.fit(X)
+        except CatBoostError as e:
+            # Typical CatBoost failure here is "All train targets are equal"
+            # or similar issues during IterativeImputer's per-column fits.
+            # Fall back to a RandomForest-based IterativeImputer, which
+            # can handle constant targets without crashing.
+            if num_method == "CB":
+                estimator = RandomForestRegressor(
+                    n_estimators=self.rf_n_estimators,
+                    n_jobs=self.tree_jobs,
+                    random_state=self.random_state,
+                )
+                imp = IterativeImputer(
+                    estimator=estimator,
+                    max_iter=self.mice_iters,
+                    random_state=self.random_state,
+                )
+                imp.fit(X)
+            else:
+                # If CatBoostError arises for non-CB methods (unlikely),
+                # re-raise so we can see it.
+                raise
         return imp, num_method
 
     def _fit_categorical_imputer(self, X: pd.DataFrame):
