@@ -605,8 +605,8 @@ def validate_baseline_direct_error(
 
     out = {}
     for name, imputer in imputer_dict.items():
-        # fit on train, transform masked test
-        X_imp = imputer.fit(X_train).transform(X_test_masked.copy())
+        # imputer is assumed ALREADY FITTED on X_train
+        X_imp = imputer.transform(X_test_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=X_test_masked.columns)
 
         # Z-score numeric in both truth & imputed using train stats
@@ -667,7 +667,8 @@ def validate_proxy_complete_case(
 
     out = {}
     for name, imputer in imputer_dict.items():
-        X_imp = imputer.fit(X_train).transform(Xcc_masked.copy())
+        # imputer is assumed ALREADY FITTED on X_train
+        X_imp = imputer.transform(Xcc_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=Xcc_masked.columns)
 
         # Z-score numeric using TRAIN stats
@@ -722,8 +723,8 @@ def validate_downstream_performance(
 
     out = {}
     for imp_name, imputer in imputer_dict.items():
-        # Fit imputer on TRAIN, transform both TRAIN and VAL
-        Xtr_imp = imputer.fit_transform(X_train_incomplete.copy())
+        # Imputer is assumed ALREADY FITTED on X_train_incomplete
+        Xtr_imp = imputer.transform(X_train_incomplete.copy())
         Xva_imp = imputer.transform(X_val_incomplete.copy())
 
         # Ensure DataFrame type and column names preserved
@@ -776,6 +777,7 @@ def validate_downstream_performance(
     return out
 
 
+
 #%%
 # =============================================================================
 # MixedImputer: unified interface for numerical and categorical imputation
@@ -790,6 +792,19 @@ import pandas as pd
 import numpy as np
 import random
 
+try:
+    import torch
+    from external_imputer.miwae_torch import (
+        MIWAEParams,
+        train_miwae_numeric,
+        miwae_impute_numeric,
+    )
+    _HAS_MIWAE = True
+except ImportError:
+    # Allows the rest of the framework to run even if MIWAE dependencies
+    # are not installed. MIWAE can be enabled later on machines that have
+    # torch + external_imputer available.
+    _HAS_MIWAE = False
 # =============================================================================
 # Imputers & “standardise-before-impute” wrapper
 # =============================================================================
@@ -815,6 +830,70 @@ class BaseImputer:
     def fit_transform(self, X, y=None):
         return self.fit(X, y).transform(X)
     
+def build_miwae_external_imputer(
+    latent_dim: int = 10,
+    hidden_dim: int = 128,
+    iw_samples: int = 20,
+    epochs: int = 500,
+    batch_size: int = 128,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs MIWAE on *numeric columns only*.
+    Categorical columns are left unchanged.
+
+    Returns: ExternalImputer instance.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    miwae_params = MIWAEParams(
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        iw_samples=iw_samples,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        import numpy as np
+        import pandas as pd
+
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        trained, params_used = train_miwae_numeric(
+            X_num,
+            params=miwae_params,
+            verbose=True,
+        )
+
+        # we return everything needed for imputation
+        model_bundle = {
+            "trained": trained,
+            "params": params_used,
+            "num_cols": num_cols,
+        }
+        return model_bundle
+
+    def impute_fn(model_bundle, X_df):
+        import numpy as np
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        trained = model_bundle["trained"]
+        params_used = model_bundle["params"]
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+        X_imp = miwae_impute_numeric(trained, params_used, X_num, L=10)
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("MIWAE", train_fn, impute_fn)
+
 class ExternalImputer(BaseImputer):
     """
     Wraps any external imputation function into a sklearn-like object.
@@ -1202,6 +1281,7 @@ def build_imputers(
     knn_k: int = 5,
     tree_jobs: int = 1,
     random_state: int = 0,
+    external_imputer: list | None = None,
 ) -> Dict[str, object]:
     """
     Return the six imputers used in the paper, built from the project's MixedImputer.
@@ -1215,57 +1295,50 @@ def build_imputers(
       "Mean/Mode", "Hot-Deck", "KNN", "LightGBM", "CatBoost", "PMM"
     """
     # 1) raw imputers using your MixedImputer
+    shared_args = dict(
+        mice_iters=mice_iters,
+        rf_n_estimators=rf_n_estimators,
+        knn_k=knn_k,
+        tree_jobs=tree_jobs,
+        random_state=random_state,
+    )
     imps = {
         "Mean/Mode": MixedImputer(
             method="Mean_Mode",
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
         "Hot-Deck": MixedImputer(
             method="Random_Random",   # your 'Random' = donor (hot-deck) per feature
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
         "KNN": MixedImputer(
             method="KNN_KNN",         # KNNImputer inside your MixedImputer
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
         "LightGBM": MixedImputer(
             method="LGBM_LGBM",       # IterativeImputer(est=LGBMRegressor)
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
         "CatBoost": MixedImputer(
             method="CB_CB",           # IterativeImputer(est=CatBoostRegressor)
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
         "PMM": MixedImputer(
             method="PMM_PMM",         # IterativeImputer(est=BayesianRidge, sample_posterior=True)
-            mice_iters=mice_iters,
-            rf_n_estimators=rf_n_estimators,
-            knn_k=knn_k,
-            tree_jobs=tree_jobs,
-            random_state=random_state,
+            **shared_args,
         ),
-    }
 
+    }
+    # 2) optionally add external imputers (e.g., MIWAE)
+    if external_imputer is not None:
+        for ext_name in external_imputer:
+            key = ext_name.strip().lower()
+            if key == "miwae":
+                if not _HAS_MIWAE:
+                    raise ImportError("MIWAE imputer requested but torch/external_imputer not available.")
+                imps["MIWAE"] = build_miwae_external_imputer()
+            else:
+                raise ValueError(f"Unknown external imputer requested: {ext_name}")
     return imps
 
 #%%
@@ -1465,14 +1538,18 @@ def run_one_dataset(
                 # ---- generate unstructured missingness on TRAIN/VAL/TEST ----
                 gen = _unstructured_mask_fn(mask_name.replace("_pair", ""))
 
+                Xp_train = build_processed(X_train)
+                Xp_val   = build_processed(X_val)
+                Xp_test  = build_processed(X_test)
+
                 Xm_train, Xpm_train, indep_idx = gen(
-                    X_train, build_processed(X_train), miss_vec, independent_feature_idx=None
+                    X_train, Xp_train, miss_vec, independent_feature_idx=None
                 )
                 Xm_val,   Xpm_val,   _ = gen(
-                    X_val, build_processed(X_val), miss_vec, independent_feature_idx=indep_idx
+                    X_val, Xp_val, miss_vec, independent_feature_idx=indep_idx
                 )
                 Xm_test,  Xpm_test,  _ = gen(
-                    X_test, build_processed(X_test), miss_vec, independent_feature_idx=indep_idx
+                    X_test, Xp_test, miss_vec, independent_feature_idx=indep_idx
                 )
 
                 # ---- apply "paired" pattern if requested --------------------
@@ -1484,21 +1561,26 @@ def run_one_dataset(
                         pair_map[i] = np.random.randint(0, half)
 
                     Xm_train, Xpm_train = generate_paired_missingness(
-                        X_train, Xm_train, build_processed(X_train), Xpm_train, pair_map
+                        X_train, Xm_train, Xp_train, Xpm_train, pair_map
                     )
                     Xm_val, Xpm_val = generate_paired_missingness(
-                        X_val, Xm_val, build_processed(X_val), Xpm_val, pair_map
+                        X_val, Xm_val, Xp_val, Xpm_val, pair_map
                     )
                     Xm_test, Xpm_test = generate_paired_missingness(
-                        X_test, Xm_test, build_processed(X_test), Xpm_test, pair_map
+                        X_test, Xm_test, Xp_test, Xpm_test, pair_map
                     )
+
+                # ---- NOW: fit imputers ONCE on incomplete Xm_train for ALL criteria ----
+                for imp in imputers.values():
+                    imp.fit(Xm_train)
+
 
                 # ---- Baseline (test set; direct error vs truth) --------------
                 baseline_out = validate_baseline_direct_error(
                     X_test_complete=X_test,
                     X_test_masked=Xm_test,
                     imputer_dict=imputers,
-                    fit_data=(X_train, y_train),
+                    fit_data=(Xm_train, y_train),
                 )
 
                 # ---- Criterion 1.1 (MCAR proxy on VAL complete-case) --------
@@ -1520,7 +1602,7 @@ def run_one_dataset(
                     )
                     c11_out = validate_proxy_complete_case(
                         imputer_dict=imputers,
-                        fit_data=(X_train, y_train),
+                        fit_data=(Xm_train, y_train),
                         prebuilt_complete_case=Xcc,
                         prebuilt_masked=Xm_cc,
                     )
@@ -1549,7 +1631,7 @@ def run_one_dataset(
 
                     c12_out = validate_proxy_complete_case(
                         imputer_dict=imputers,
-                        fit_data=(X_train, y_train),
+                        fit_data=(Xm_train, y_train),
                         prebuilt_complete_case=Xcc,
                         prebuilt_masked=Xm_cc,
                     )
