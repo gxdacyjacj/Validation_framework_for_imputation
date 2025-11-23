@@ -1055,6 +1055,7 @@ class MixedImputer(BaseEstimator, TransformerMixin):
 
         if cat_method in ("MODE", "MEAN"):
             imp = SimpleImputer(strategy="most_frequent")
+            imp.fit(X)
         elif cat_method == "RANDOM":
             imp = None  # handled manually in transform
         else:
