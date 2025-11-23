@@ -85,11 +85,23 @@ def load_steel(path=None):
 def load_energy(path=None):
     if path is None:
         path = os.path.join(DATA_DIR, "Energy_efficiency.csv")
+
     df = pd.read_csv(path, skiprows=[1], encoding="unicode_escape")
+
     X = df.iloc[:, 0:8].copy()
     y = df.iloc[:, 8].astype(float)
-    return X, y, "Energy"
 
+    # ---- According to dataset definition:
+    # X6 = Orientation (categorical: 2,3,4,5)
+    # X8 = Glazing Area Distribution (categorical: 0–5)
+    # Cast them to 'object' dtype so MixedImputer treats them correctly.
+    categorical_cols = ["X6", "X8"]
+
+    for col in categorical_cols:
+        if col in X.columns:
+            X[col] = X[col].astype("object")
+
+    return X, y, "Energy"
 # -------------------------------------------------------------------------
 # Unified loader — ORDER MATCHES PAPER
 # -------------------------------------------------------------------------
