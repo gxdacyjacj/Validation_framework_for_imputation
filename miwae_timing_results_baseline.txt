@@ -1,0 +1,15 @@
+Timing + performance summary (Baseline-based)
+Dataset used: Steel
+Mask: MCAR, Missing rate: 0.10, Repeats: 10
+
+Timings (seconds):
+Imputer        Time (s)
+------------------------------
+KNN         :      2.2 s
+notMIWAE    :     57.1 s
+
+Mean BASELINE error (missing-only RMSE):
+Imputer        Mean error
+------------------------------
+KNN         :       0.7057
+notMIWAE    :       0.6771
