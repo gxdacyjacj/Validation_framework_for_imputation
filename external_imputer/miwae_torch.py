@@ -21,11 +21,11 @@ class MIWAEParams:
 
 class MIWAEModel(nn.Module):
     """
-    Simple MIWAE-style model with Gaussian decoder.
+    Simple MIWAE-style model with Student-t decoder.
 
     - Prior:      p(z) = N(0, I)
     - Encoder:    q(z|x_obs) = N(mu(x), diag(sigma^2(x)))
-    - Decoder:    p(x|z) = N(mu_x(z), diag(sigma_x^2(z)))
+    - Decoder:    p(x|z) = StudentT(mu_x(z), scale_x(z), df_x(z)) (factorised over features)
     """
 
     def __init__(self, p: int, params: MIWAEParams):
@@ -44,14 +44,15 @@ class MIWAEModel(nn.Module):
             nn.Linear(h, 2 * d),  # mean and log-variance
         )
 
-        # p(x | z)
         self.decoder = nn.Sequential(
             nn.Linear(d, h),
             nn.ReLU(),
             nn.Linear(h, h),
             nn.ReLU(),
-            nn.Linear(h, 2 * p),  # mean and log-variance of each feature
+            nn.Linear(h, 3 * p),  # mean, log-scale, log-df
         )
+
+
 
     # ------------------------------------------------------------------ #
     # Encoder / decoder helpers
@@ -63,12 +64,19 @@ class MIWAEModel(nn.Module):
         logvar = out[..., d:]
         return mu, logvar
 
+
     def decode(self, z):
-        out = self.decoder(z)
+        out = self.decoder(z)  # (..., 3p)
         p = self.p
         mean = out[..., :p]
-        logvar = out[..., p:]
-        return mean, logvar
+        log_scale = out[..., p:2*p]
+        log_df = out[..., 2*p:3*p]
+
+        # ensure positivity / reasonable ranges
+        scale = torch.nn.functional.softplus(log_scale) + 1e-3
+        df = torch.nn.functional.softplus(log_df) + 3.0   # df > 3 (finite variance, etc.)
+
+        return mean, scale, df
 
     # ------------------------------------------------------------------ #
     # MIWAE loss (IWAE bound with masking on observed entries)
@@ -104,22 +112,23 @@ class MIWAEModel(nn.Module):
 
         # Decode all z's
         z_flat = z.reshape(K * batch_size, d)
-        mean_x, logvar_x = self.decode(z_flat)  # (K*batch, p)
-        std_x = torch.exp(0.5 * logvar_x)
+        mean_x, scale_x, df_x = self.decode(z_flat)  # (K*batch, p) each
 
-        # Tile x and mask K times
-        x_tiled = x.repeat(K, 1)        # (K*batch, p)
-        mask_tiled = mask.repeat(K, 1)  # (K*batch, p)
 
-        # log p(x_obs | z): Gaussian per feature, only on observed entries
-        log_px_z_flat = -0.5 * (
-            ((x_tiled - mean_x) / std_x) ** 2
-            + 2 * torch.log(std_x)
-            + np.log(2 * np.pi)
-        )  # (K*batch, p)
+        x_flat = x.repeat(K, 1)  # (K*batch, p)
+        mask_flat = mask.repeat(K, 1)
 
-        log_px_z = torch.sum(log_px_z_flat * mask_tiled, dim=-1)  # (K*batch,)
-        log_px_z = log_px_z.view(K, batch_size)                   # (K, batch)
+        # build StudentT distribution per feature
+        # We'll compute elementwise log_prob manually with StudentT:
+        student = torch.distributions.StudentT(
+            df=df_x,
+            loc=mean_x,
+            scale=scale_x
+        )
+        log_px_z_flat = student.log_prob(x_flat)  # (K*batch, p)
+
+        log_px_z = torch.sum(log_px_z_flat * mask_flat, dim=-1)  # (K*batch,)
+        log_px_z = log_px_z.view(K, batch_size)                 # (K, batch)
 
         # MIWAE / IWAE bound
         log_w = log_px_z + log_pz - log_qz_x           # (K, batch)
@@ -226,7 +235,7 @@ def miwae_impute_numeric(
         eps = torch.randn(K, n, d, device=device)
         z = mu.unsqueeze(0) + std_z.unsqueeze(0) * eps  # (K, n, d)
         z_flat = z.reshape(K * n, d)
-        mean_x, _ = model.decode(z_flat)
+        mean_x, _, _ = model.decode(z_flat)
         mean_x = mean_x.view(K, n, p)
         x_rec = mean_x.mean(dim=0)  # (n, p)
 
