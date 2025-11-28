@@ -837,7 +837,17 @@ try:
     _HAS_NOTMIWAE = True
 except ImportError:
     _HAS_NOTMIWAE = False
-    
+
+# GAIN (PyTorch) imputer
+try:
+    from external_imputer.gain_torch import (
+        GAINParams,
+        train_gain_numeric,
+        gain_impute_numeric,
+    )
+    _HAS_GAIN = True
+except ImportError:
+    _HAS_GAIN = False
 # =============================================================================
 # Imputers & “standardise-before-impute” wrapper
 # =============================================================================
@@ -995,6 +1005,80 @@ def build_notmiwae_external_imputer(
         return X
 
     return ExternalImputer("notMIWAE", train_fn, impute_fn)
+
+def build_gain_external_imputer(
+    batch_size: int = 128,
+    hint_rate: float = 0.9,
+    alpha: float = 100.0,
+    iterations: int = 10000,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs GAIN (PyTorch)
+    on numeric columns only. Categorical columns are left unchanged.
+    """
+    if not _HAS_GAIN:
+        raise ImportError(
+            "GAIN imputer requested but external_imputer.gain_torch "
+            "could not be imported."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    gain_params = GAINParams(
+        batch_size=batch_size,
+        hint_rate=hint_rate,
+        alpha=alpha,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("GAIN external imputer requires numeric columns.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        generator, norm_params = train_gain_numeric(
+            X_num,
+            params=gain_params,
+            verbose=True,
+        )
+
+        return {
+            "generator": generator,
+            "norm_params": norm_params,
+            "num_cols": list(num_cols),
+            "gain_params": gain_params,
+        }
+
+    def impute_fn(model_bundle, X_df):
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        generator = model_bundle["generator"]
+        norm_params = model_bundle["norm_params"]
+        gain_params_local = model_bundle.get("gain_params", gain_params)
+
+        if len(num_cols) == 0:
+            return X
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+        X_imp = gain_impute_numeric(
+            generator,
+            norm_params,
+            X_num,
+            params=gain_params_local,
+        )
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("GAIN", train_fn, impute_fn)
 
 class ExternalImputer(BaseImputer):
     """
@@ -1451,6 +1535,10 @@ def build_imputers(
                 if not _HAS_NOTMIWAE:
                     raise ImportError("notMIWAE imputer requested but tensorflow/external_imputer not available.")
                 imps["notMIWAE"] = build_notmiwae_external_imputer()
+            elif key == "gain":
+                if not _HAS_GAIN:
+                    raise ImportError("GAIN imputer requested but torch/external_imputer not available.")
+                imps["GAIN"] = build_gain_external_imputer()
             else:
                 raise ValueError(f"Unknown external imputer requested: {ext_name}")
 
