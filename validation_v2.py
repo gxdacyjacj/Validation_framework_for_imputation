@@ -691,7 +691,6 @@ def validate_proxy_complete_case(
 # -----------------------------------------------------------------------------
 # Criterion 2 — per-model errors preserved (plus mean)
 # -----------------------------------------------------------------------------
-
 def validate_downstream_performance(
     *,
     X_train_incomplete: pd.DataFrame,
@@ -700,78 +699,99 @@ def validate_downstream_performance(
     y_val: pd.Series,
     imputer_dict: Dict[str, object],
     model_dict: Optional[Dict[str, object]] = None,
-) -> Dict[str, Dict[str, object]]:
+) -> Dict[str, Dict[str, float]]:
     """
-    Return per-imputer dict:
-      {
-        'per_model': {model_name: error},
-        'mean':      float
-      }
-    - For regression: RMSE on standardised y (fit stats on train).
-    - For classification: 1 - accuracy (expects classifiers in model_dict).
-    """
-    task = _detect_task_type(y_train)
-    models = model_dict or DEFAULT_MODEL_LIST
+    Criterion 2: downstream predictive performance on a validation set.
 
-    # Standardise y for regression (fit stats on train only).
-    if task == "regression":
-        y_mean, y_std = y_train.mean(), y_train.std(ddof=0) or 1.0
-        y_tr = (y_train - y_mean) / y_std
-        y_va = (y_val - y_mean) / y_std
+    For each imputer:
+      1) Fit imputer on X_train_incomplete
+      2) Impute both TRAIN and VAL
+      3) One-hot encode categoricals
+      4) Align TRAIN/VAL columns (same feature names & order)
+      5) Train each downstream model on TRAIN, evaluate on VAL
+
+    Returns
+    -------
+    out : dict
+        out[imputer_name] = {
+            "per_model": {model_name: error, ...},
+            "mean": average_error_over_models
+        }
+    """
+    if model_dict is None:
+        models = DEFAULT_MODEL_LIST
     else:
-        y_tr, y_va = y_train, y_val
+        models = model_dict
 
-    out = {}
+    # Decide whether we're in regression or classification mode.
+    # In this project all datasets are regression, but keep this for generality.
+    y_tr = pd.Series(y_train).reset_index(drop=True)
+    y_va = pd.Series(y_val).reset_index(drop=True)
+    task = "regression"
+    if y_tr.dtype == "O" or len(np.unique(y_tr)) <= 10:
+        # crude heuristic, but fine for internal use
+        task = "classification"
+
+    out: Dict[str, Dict[str, float]] = {}
+
     for imp_name, imputer in imputer_dict.items():
-        # Imputer is assumed ALREADY FITTED on X_train_incomplete
-        Xtr_imp = imputer.transform(X_train_incomplete.copy())
+        # 1) Fit imputer on TRAIN, transform both TRAIN and VAL
+        Xtr_imp = imputer.fit_transform(X_train_incomplete.copy())
         Xva_imp = imputer.transform(X_val_incomplete.copy())
 
-        # Ensure DataFrame type and column names preserved
         Xtr_imp = pd.DataFrame(Xtr_imp, columns=X_train_incomplete.columns)
         Xva_imp = pd.DataFrame(Xva_imp, columns=X_val_incomplete.columns)
 
-        # One-hot encode categoricals for downstream models
+        # 2) One-hot encode categoricals for downstream models
         Xtr_num = build_processed(Xtr_imp)
         Xva_num = build_processed(Xva_imp)
 
-        # --- NEW: if y_train is (effectively) constant, downstream comparison
-        # is not meaningful; skip and return NaN for this imputer.
+        # 3) Align TRAIN and VAL columns so feature names always match
+        #    Some categories may appear only in TRAIN or only in VAL.
+        #    We create the union of columns and fill missing ones with 0.0.
+        cols_union = sorted(set(Xtr_num.columns) | set(Xva_num.columns))
+        Xtr_num = Xtr_num.reindex(columns=cols_union, fill_value=0.0)
+        Xva_num = Xva_num.reindex(columns=cols_union, fill_value=0.0)
+
+        # 4) If y_train is (effectively) constant, downstream comparison
+        #    is not meaningful; skip and return NaN for this imputer.
         if pd.Series(y_tr).nunique() <= 1:
             out[imp_name] = {
                 "per_model": {},
                 "mean": np.nan,
             }
             continue
-        # --------------------------------------------------------------------
 
-        per_model = []
-        per_model_dict = {}
+        per_model: Dict[str, float] = {}
+        errs: List[float] = []
 
+        # 5) Train and evaluate each downstream model
         for mname, model in models.items():
-            # Fresh instance
+            # Fresh instance with same hyperparameters
             mdl = model.__class__(**getattr(model, "get_params", lambda: {})())
 
             mdl.fit(Xtr_num, y_tr)
             yhat = mdl.predict(Xva_num)
 
             if task == "regression":
-                # RMSE on standardised y
+                # RMSE on original scale; in your paper you standardise y beforehand
                 err = float(np.sqrt(np.mean((np.asarray(y_va) - np.asarray(yhat)) ** 2)))
             else:
+                # classification: 1 - accuracy
                 if hasattr(mdl, "predict"):
                     ypred = mdl.predict(Xva_num)
                     err = float(1.0 - accuracy_score(y_va, ypred))
                 else:
+                    # fallback if model returns continuous scores
                     ypred = (yhat > np.median(yhat)).astype(y_va.dtype)
                     err = float(1.0 - accuracy_score(y_va, ypred))
 
-            per_model_dict[mname] = err
-            per_model.append(err)
+            per_model[mname] = err
+            errs.append(err)
 
         out[imp_name] = {
-            "per_model": per_model_dict,
-            "mean": float(np.mean(per_model)) if per_model else np.nan,
+            "per_model": per_model,
+            "mean": float(np.mean(errs)) if errs else np.nan,
         }
 
     return out
@@ -792,6 +812,7 @@ import pandas as pd
 import numpy as np
 import random
 
+# Existing MIWAE (PyTorch) import
 try:
     import torch
     from external_imputer.miwae_torch import (
@@ -805,6 +826,28 @@ except ImportError:
     # are not installed. MIWAE can be enabled later on machines that have
     # torch + external_imputer available.
     _HAS_MIWAE = False
+
+# notMIWAE imputers
+try:
+    from external_imputer.notmiwae_torch import (
+        NotMIWAEParams,
+        train_notmiwae_numeric,
+        notmiwae_impute_numeric,
+    )
+    _HAS_NOTMIWAE = True
+except ImportError:
+    _HAS_NOTMIWAE = False
+
+# GAIN (PyTorch) imputer
+try:
+    from external_imputer.gain_torch import (
+        GAINParams,
+        train_gain_numeric,
+        gain_impute_numeric,
+    )
+    _HAS_GAIN = True
+except ImportError:
+    _HAS_GAIN = False
 # =============================================================================
 # Imputers & “standardise-before-impute” wrapper
 # =============================================================================
@@ -893,6 +936,149 @@ def build_miwae_external_imputer(
         return X
 
     return ExternalImputer("MIWAE", train_fn, impute_fn)
+
+def build_notmiwae_external_imputer(
+    latent_dim: int = 50,
+    hidden_dim: int = 100,
+    iw_samples: int = 10,
+    epochs: int = 500,
+    batch_size: int = 128,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs self-masking notMIWAE (PyTorch)
+    on numeric columns only. Categorical columns are left unchanged.
+    """
+    if not _HAS_NOTMIWAE:
+        raise ImportError(
+            "notMIWAE imputer requested but external_imputer.notmiwae_torch "
+            "could not be imported."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    notmiwae_params = NotMIWAEParams(
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        iw_samples=iw_samples,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("notMIWAE external imputer requires numeric columns.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        trained, params_used = train_notmiwae_numeric(
+            X_num,
+            params=notmiwae_params,
+            verbose=True,
+        )
+
+        return {
+            "trained": trained,
+            "params": params_used,
+            "num_cols": list(num_cols),
+        }
+
+    def impute_fn(model_bundle, X_df):
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        trained = model_bundle["trained"]
+        params_used = model_bundle["params"]
+
+        if len(num_cols) == 0:
+            return X
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+        X_imp = notmiwae_impute_numeric(trained, params_used, X_num, L=10)
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("notMIWAE", train_fn, impute_fn)
+
+def build_gain_external_imputer(
+    batch_size: int = 128,
+    hint_rate: float = 0.9,
+    alpha: float = 100.0,
+    iterations: int = 10000,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs GAIN (PyTorch)
+    on numeric columns only. Categorical columns are left unchanged.
+    """
+    if not _HAS_GAIN:
+        raise ImportError(
+            "GAIN imputer requested but external_imputer.gain_torch "
+            "could not be imported."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    gain_params = GAINParams(
+        batch_size=batch_size,
+        hint_rate=hint_rate,
+        alpha=alpha,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("GAIN external imputer requires numeric columns.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        generator, norm_params = train_gain_numeric(
+            X_num,
+            params=gain_params,
+            verbose=True,
+        )
+
+        return {
+            "generator": generator,
+            "norm_params": norm_params,
+            "num_cols": list(num_cols),
+            "gain_params": gain_params,
+        }
+
+    def impute_fn(model_bundle, X_df):
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        generator = model_bundle["generator"]
+        norm_params = model_bundle["norm_params"]
+        gain_params_local = model_bundle.get("gain_params", gain_params)
+
+        if len(num_cols) == 0:
+            return X
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+        X_imp = gain_impute_numeric(
+            generator,
+            norm_params,
+            X_num,
+            params=gain_params_local,
+        )
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("GAIN", train_fn, impute_fn)
 
 class ExternalImputer(BaseImputer):
     """
@@ -1276,6 +1462,7 @@ class MixedImputer(BaseEstimator, TransformerMixin):
 # =============================================================================
 def build_imputers(
     *,
+    internal_imputer: list | None = ("Mean/Mode", "Hot-Deck", "KNN", "LightGBM", "CatBoost", "PMM"),
     mice_iters: int = 10,
     rf_n_estimators: int = 200,
     knn_k: int = 5,
@@ -1284,17 +1471,24 @@ def build_imputers(
     external_imputer: list | None = None,
 ) -> Dict[str, object]:
     """
-    Return the six imputers used in the paper, built from the project's MixedImputer.
+    Return a dictionary of imputers built from MixedImputer.
 
-    Notes on method codes (kept consistent with your MixedImputer):
-      - Univariate: "Mean", "Median", "Random" (hot-deck)
-      - Multivariate (via IterativeImputer): "KNN", "PMM", "Lin", "RF", "LGBM", "CB"
-      - MixedImputer expects "<num>_<cat>", so we mirror the same for both types.
-
-    Returned keys (exact, stable names):
-      "Mean/Mode", "Hot-Deck", "KNN", "LightGBM", "CatBoost", "PMM"
+    - By default `internal_imputer` includes all six built-in methods.
+    - If the caller explicitly passes internal_imputer=None and external_imputer=None
+      a ValueError is raised (requires at least one imputer source).
     """
-    # 1) raw imputers using your MixedImputer
+    # If caller explicitly set both to None -> error
+    if internal_imputer is None and external_imputer is None:
+        raise ValueError("At least one of internal_imputer or external_imputer must be provided.")
+
+    # canonical set used to expand "all" if requested
+    all_internal = ["Mean/Mode", "Hot-Deck", "KNN", "LightGBM", "CatBoost", "PMM"]
+
+    # Normalize requested list
+    requested = list(internal_imputer) if internal_imputer is not None else []
+    if isinstance(requested, str):
+        requested = [requested]
+
     shared_args = dict(
         mice_iters=mice_iters,
         rf_n_estimators=rf_n_estimators,
@@ -1302,33 +1496,33 @@ def build_imputers(
         tree_jobs=tree_jobs,
         random_state=random_state,
     )
-    imps = {
-        "Mean/Mode": MixedImputer(
-            method="Mean_Mode",
-            **shared_args,
-        ),
-        "Hot-Deck": MixedImputer(
-            method="Random_Random",   # your 'Random' = donor (hot-deck) per feature
-            **shared_args,
-        ),
-        "KNN": MixedImputer(
-            method="KNN_KNN",         # KNNImputer inside your MixedImputer
-            **shared_args,
-        ),
-        "LightGBM": MixedImputer(
-            method="LGBM_LGBM",       # IterativeImputer(est=LGBMRegressor)
-            **shared_args,
-        ),
-        "CatBoost": MixedImputer(
-            method="CB_CB",           # IterativeImputer(est=CatBoostRegressor)
-            **shared_args,
-        ),
-        "PMM": MixedImputer(
-            method="PMM_PMM",         # IterativeImputer(est=BayesianRidge, sample_posterior=True)
-            **shared_args,
-        ),
 
-    }
+    imps: Dict[str, object] = {}
+
+    def _norm(name: str) -> str:
+        return str(name).lower().replace(" ", "").replace("-", "").replace("_", "").replace("/", "")
+
+    # expand "all" token if present
+    if any(_norm(x) == "all" for x in requested):
+        requested = all_internal
+
+    for name in requested:
+        n = _norm(name)
+        if n in ("meanmode", "mean", "meanmode"):
+            imps["Mean/Mode"] = MixedImputer(method="Mean_Mode", **shared_args)
+        elif n in ("hotdeck", "random", "hot-deck"):
+            imps["Hot-Deck"] = MixedImputer(method="Random_Random", **shared_args)
+        elif n in ("knn", "knnimputer"):
+            imps["KNN"] = MixedImputer(method="KNN_KNN", **shared_args)
+        elif n in ("lightgbm", "lgbm", "lightgbmregressor"):
+            imps["LightGBM"] = MixedImputer(method="LGBM_LGBM", **shared_args)
+        elif n in ("catboost", "cb", "catboostregressor"):
+            imps["CatBoost"] = MixedImputer(method="CB_CB", **shared_args)
+        elif n in ("pmm", "predictivemeanmatching"):
+            imps["PMM"] = MixedImputer(method="PMM_PMM", **shared_args)
+        else:
+            raise ValueError(f"Unknown internal imputer requested: {name}")
+
     # 2) optionally add external imputers (e.g., MIWAE)
     if external_imputer is not None:
         for ext_name in external_imputer:
@@ -1337,8 +1531,17 @@ def build_imputers(
                 if not _HAS_MIWAE:
                     raise ImportError("MIWAE imputer requested but torch/external_imputer not available.")
                 imps["MIWAE"] = build_miwae_external_imputer()
+            elif key == "notmiwae":
+                if not _HAS_NOTMIWAE:
+                    raise ImportError("notMIWAE imputer requested but tensorflow/external_imputer not available.")
+                imps["notMIWAE"] = build_notmiwae_external_imputer()
+            elif key == "gain":
+                if not _HAS_GAIN:
+                    raise ImportError("GAIN imputer requested but torch/external_imputer not available.")
+                imps["GAIN"] = build_gain_external_imputer()
             else:
                 raise ValueError(f"Unknown external imputer requested: {ext_name}")
+
     return imps
 
 #%%
