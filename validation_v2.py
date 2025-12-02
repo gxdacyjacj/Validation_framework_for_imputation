@@ -848,6 +848,28 @@ try:
     _HAS_GAIN = True
 except ImportError:
     _HAS_GAIN = False
+
+# MisGAN-lite (PyTorch) imputer
+try:
+    from external_imputer.misgan_lite_torch import (
+        MisGANLiteParams,
+        train_misgan_lite_numeric,
+        misgan_lite_impute_numeric,
+    )
+    _HAS_MISGAN_LITE = True
+except ImportError:
+    _HAS_MISGAN_LITE = False
+
+# CACTI-lite (Transformer masked autoencoder for tabular imputation)
+try:
+    from external_imputer.cacti_lite_torch import (
+        CACTILiteParams,
+        train_cacti_lite_numeric,
+        cacti_lite_impute_numeric,
+    )
+    _HAS_CACTI_LITE = True
+except ImportError:
+    _HAS_CACTI_LITE = False
 # =============================================================================
 # Imputers & “standardise-before-impute” wrapper
 # =============================================================================
@@ -1079,6 +1101,179 @@ def build_gain_external_imputer(
         return X
 
     return ExternalImputer("GAIN", train_fn, impute_fn)
+
+def build_misgan_lite_external_imputer(
+    batch_size: int = 128,
+    alpha: float = 100.0,
+    iterations: int = 10000,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs MisGAN-lite (PyTorch)
+    on numeric columns only. Categorical columns are left unchanged.
+    """
+    if not _HAS_MISGAN_LITE:
+        raise ImportError(
+            "MisGAN-lite imputer requested but external_imputer.misgan_lite_torch "
+            "could not be imported."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    misgan_params = MisGANLiteParams(
+        batch_size=batch_size,
+        alpha=alpha,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("MisGAN-lite external imputer requires numeric columns.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        generator, norm_params = train_misgan_lite_numeric(
+            X_num,
+            params=misgan_params,
+            verbose=True,
+        )
+
+        return {
+            "generator": generator,
+            "norm_params": norm_params,
+            "num_cols": list(num_cols),
+            "misgan_params": misgan_params,
+        }
+
+    def impute_fn(model_bundle, X_df):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        generator = model_bundle["generator"]
+        norm_params = model_bundle["norm_params"]
+        misgan_params_local = model_bundle.get("misgan_params", misgan_params)
+
+        if len(num_cols) == 0:
+            return X
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+        X_imp = misgan_lite_impute_numeric(
+            generator,
+            norm_params,
+            X_num,
+            params=misgan_params_local,
+        )
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("MisGAN-lite", train_fn, impute_fn)
+
+def build_cacti_lite_external_imputer(
+    d_model: int = 64,
+    n_heads: int = 4,
+    n_layers: int = 2,
+    dim_ff: int = 256,
+    batch_size: int = 128,
+    iterations: int = 5000,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+):
+    """
+    Build an ExternalImputer that runs CACTI-lite (Transformer masked autoencoder)
+    on numeric columns only. Categorical columns are left unchanged.
+
+    Kept from full CACTI:
+      - features as tokens (Transformer encoder over columns)
+      - masked reconstruction objective
+      - copy masking based on empirical missingness patterns
+      - per-feature learnable context embeddings
+
+    Simplifications:
+      - no median-truncation (MT-CM) yet
+      - context is learned embeddings, not text-LM features
+      - numeric columns only
+    """
+    if not _HAS_CACTI_LITE:
+        raise ImportError(
+            "CACTI-lite imputer requested but external_imputer.cacti_lite_torch "
+            "could not be imported."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cacti_params = CACTILiteParams(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        dim_ff=dim_ff,
+        batch_size=batch_size,
+        iterations=iterations,
+        learning_rate=learning_rate,
+        device=device,
+    )
+
+    def train_fn(X_df):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("CACTI-lite external imputer requires at least one numeric column.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        # CACTI-lite training: Transformer MAE + copy masking, only on numeric part
+        model, norm_params = train_cacti_lite_numeric(
+            X_num,
+            params=cacti_params,
+            verbose=True,
+        )
+
+        return {
+            "model": model,
+            "norm_params": norm_params,
+            "num_cols": list(num_cols),
+            "cacti_params": cacti_params,
+        }
+
+    def impute_fn(model_bundle, X_df):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        if len(num_cols) == 0:
+            return X
+
+        model = model_bundle["model"]
+        norm_params = model_bundle["norm_params"]
+        cacti_params_local = model_bundle.get("cacti_params", cacti_params)
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        # CACTI-lite inference: mask = true observed mask; predict missing entries
+        X_imp = cacti_lite_impute_numeric(
+            model,
+            norm_params,
+            X_num,
+            params=cacti_params_local,
+        )
+
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("CACTI-lite", train_fn, impute_fn)
 
 class ExternalImputer(BaseImputer):
     """
@@ -1539,6 +1734,18 @@ def build_imputers(
                 if not _HAS_GAIN:
                     raise ImportError("GAIN imputer requested but torch/external_imputer not available.")
                 imps["GAIN"] = build_gain_external_imputer()
+            elif key == "misgan-lite":
+                if not _HAS_MISGAN_LITE:
+                    raise ImportError(
+                        "MisGAN-lite imputer requested but external_imputer.misgan_lite_torch not available."
+                    )
+                imps["MisGAN-lite"] = build_misgan_lite_external_imputer()                
+            elif key == "cacti-lite":
+                if not _HAS_CACTI_LITE:
+                    raise ImportError(
+                        "CACTI-lite imputer requested but external_imputer.cacti_lite_torch not available."
+                    )
+                imps["CACTI-lite"] = build_cacti_lite_external_imputer()                
             else:
                 raise ValueError(f"Unknown external imputer requested: {ext_name}")
 
