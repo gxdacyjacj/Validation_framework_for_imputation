@@ -5,11 +5,21 @@ Mask: MCAR, Missing rate: 0.10, Repeats: 10
 Timings (seconds):
 Imputer        Time (s)
 ------------------------------
-KNN         :      2.2 s
-notMIWAE    :     57.1 s
+KNN         :      1.4 s
+CatBoost    :    148.2 s
+MIWAE       :     72.1 s
+notMIWAE    :     45.6 s
+GAIN        :    128.7 s
+MisGAN-lite :    135.4 s
+CACTI-lite  :   1383.0 s
 
 Mean BASELINE error (missing-only RMSE):
 Imputer        Mean error
 ------------------------------
 KNN         :       0.7057
-notMIWAE    :       0.6771
+CatBoost    :       0.7221
+MIWAE       :       0.6823
+notMIWAE    :       0.7029
+GAIN        :       0.8265
+MisGAN-lite :       0.8840
+CACTI-lite  :       0.7329

@@ -870,6 +870,36 @@ try:
     _HAS_CACTI_LITE = True
 except ImportError:
     _HAS_CACTI_LITE = False
+
+try:
+    from external_imputer.hi_vae_torch import (
+        HIVAEParams,
+        train_hivae_mixed,
+        hivae_impute_mixed,
+    )
+    _HAS_HIVAE = True
+except ImportError:
+    _HAS_HIVAE = False
+try:
+    from external_imputer.mcflow_torch import (
+        MCFlowParams,
+        train_mcflow_numeric,
+        mcflow_impute_numeric,
+    )
+    _HAS_MCFLOW = True
+except ImportError:
+    _HAS_MCFLOW = False
+
+# Diffusion-lite (numeric, PyTorch) imputer
+try:
+    from external_imputer.diffusion_lite_torch import (
+        DiffusionParams,
+        train_diffusion_numeric,
+        diffusion_impute_numeric,
+    )
+    _HAS_DIFFUSION_LITE = True
+except Exception:
+    _HAS_DIFFUSION_LITE = False
 # =============================================================================
 # Imputers & “standardise-before-impute” wrapper
 # =============================================================================
@@ -1274,6 +1304,284 @@ def build_cacti_lite_external_imputer(
         return X
 
     return ExternalImputer("CACTI-lite", train_fn, impute_fn)
+
+def build_hivae_external_imputer(
+    latent_dim: int = 10,
+    hidden_dim: int = 128,
+    n_components: int = 5,
+    iw_samples: int = 10,
+    epochs: int = 500,
+    batch_size: int = 128,
+    learning_rate: float = 1e-3,
+    device: str | None = None,
+    max_categories: int = 50,
+    seed: int = 0,
+    feature_types: list | None = None,
+):
+    """
+    Build an ExternalImputer that runs HI-VAE-lite on *all columns*,
+    handling both numerical and categorical variables.
+
+    - Numerical cols are used as-is.
+    - Categorical cols are internally encoded as integer codes (0..K-1),
+      with NaNs kept as NaNs. After imputation, codes are mapped back
+      to the original categories.
+
+    Parameters like latent_dim, hidden_dim, n_components, ... are passed
+    directly into HIVAEParams.  `feature_types` is optional; if None,
+    hi_vae_torch will infer types automatically.
+    """
+    if not _HAS_HIVAE:
+        raise ImportError(
+            "HIVAE imputer requested but external_imputer.hi_vae_torch "
+            "or its dependencies are not available."
+        )
+
+    if device is None:
+        device = "cuda" if ("torch" in globals() and torch.cuda.is_available()) else "cpu"
+
+    hivae_params = HIVAEParams(
+        latent_dim=latent_dim,
+        hidden_dim=hidden_dim,
+        n_components=n_components,
+        iw_samples=iw_samples,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        device=device,
+        max_categories=max_categories,
+        seed=seed,
+    )
+
+    def _encode_categoricals(X: pd.DataFrame):
+        """
+        Return:
+          X_work : DataFrame with all columns numeric (cats -> codes)
+          num_cols : list of numeric column names
+          cat_info : dict[col] -> list(categories)  (for decoding)
+        """
+        X_work = X.copy()
+        num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+        cat_cols = [c for c in X.columns if c not in num_cols]
+
+        cat_info: dict[str, list] = {}
+
+        for c in cat_cols:
+            col = X_work[c]
+            cat = pd.Categorical(col)
+            codes = cat.codes.astype(float)
+            # pandas uses -1 for NaN; convert to np.nan so HI-VAE sees missingness
+            codes[codes < 0] = np.nan
+            X_work[c] = codes
+            cat_info[c] = list(cat.categories)
+
+        return X_work, num_cols, cat_info
+
+    def _decode_categoricals(X_imp_vals: pd.DataFrame, num_cols, cat_info):
+        """
+        Map imputed numeric codes back to original categories.
+        """
+        X_out = X_imp_vals.copy()
+
+        # numeric columns stay as floats
+        for c in num_cols:
+            X_out[c] = X_out[c].astype(float)
+
+        # categorical columns: round to nearest int and map back to labels
+        for c, categories in cat_info.items():
+            if c not in X_out.columns:
+                continue
+            vals = X_out[c].round().astype(int)
+            vals = vals.clip(0, len(categories) - 1)
+            X_out[c] = pd.Categorical.from_codes(vals, categories=categories)
+
+        return X_out
+
+    # ---------- train_fn -----------------------------------------------------
+    def train_fn(X_df: pd.DataFrame):
+        X = X_df.copy()
+        X_work, num_cols, cat_info = _encode_categoricals(X)
+
+        X_all = X_work.to_numpy(dtype=float)
+
+        trained, params_used = train_hivae_mixed(
+            X_all,
+            params=hivae_params,
+            feature_types=feature_types,
+            verbose=False,
+        )
+
+        return {
+            "trained": trained,
+            "params": params_used,
+            "num_cols": num_cols,
+            "cat_info": cat_info,
+            "columns": list(X.columns),
+        }
+
+    # ---------- impute_fn ----------------------------------------------------
+    def impute_fn(model_bundle, X_df: pd.DataFrame):
+        trained = model_bundle["trained"]
+        params_used = model_bundle["params"]
+        num_cols = model_bundle["num_cols"]
+        cat_info = model_bundle["cat_info"]
+        columns = model_bundle["columns"]
+
+        X = X_df.copy()
+        # re-encode categoricals using the same categories as in training
+        X_work = X.copy()
+        for c, categories in cat_info.items():
+            if c in X_work.columns:
+                col = X_work[c]
+                cat = pd.Categorical(col, categories=categories)
+                codes = cat.codes.astype(float)
+                codes[codes < 0] = np.nan
+                X_work[c] = codes
+
+        X_all = X_work.to_numpy(dtype=float)
+
+        X_imp_all = hivae_impute_mixed(
+            trained,
+            params_used,
+            X_all,
+            L=10,        # number of MC samples for imputation
+        )
+
+        X_imp_vals = pd.DataFrame(X_imp_all, columns=columns)
+        X_imp_full = _decode_categoricals(X_imp_vals, num_cols, cat_info)
+
+        # Preserve original column order
+        X_imp_full = X_imp_full[columns]
+        return X_imp_full
+
+    return ExternalImputer("HIVAE", train_fn, impute_fn)
+
+def build_mcflow_external_imputer(
+    epochs: int = 300,
+    n_coupling_layers: int = 6,
+    hidden_dim: int = 128,
+    device: str | None = None,
+    seed: int = 0,
+):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    params = MCFlowParams(
+        hidden_dim=hidden_dim,
+        n_coupling_layers=n_coupling_layers,
+        epochs=epochs,
+        device=device,
+        seed=seed,
+    )
+
+    def train_fn(X_df: pd.DataFrame):
+        X_np = X_df.to_numpy(dtype=float)
+        flow, p_used, aux = train_mcflow_numeric(X_np, p_used, verbose=False)
+        return {"flow": flow, "params": p_used, "aux": aux, "columns": list(X_df.columns)}
+
+    def impute_fn(model_bundle, X_df: pd.DataFrame):
+        flow = model_bundle["flow"]
+        p_used = model_bundle["params"]
+        aux = model_bundle["aux"]
+        cols = model_bundle["columns"]
+
+        X_np = X_df.to_numpy(dtype=float)
+        X_imp = mcflow_impute_numeric(flow, p_used, aux, X_np)
+        return pd.DataFrame(X_imp, columns=cols)
+
+    return ExternalImputer("MCFlow-lite", train_fn, impute_fn)
+
+def build_diffusion_lite_external_imputer(
+    T: int = 50,
+    beta_start: float = 1e-4,
+    beta_end: float = 0.02,
+    hidden_dim: int = 128,
+    time_dim: int = 64,
+    epochs: int = 500,
+    batch_size: int = 128,
+    learning_rate: float = 1e-3,
+    n_samples_impute: int = 5,
+    device: str | None = None,
+    seed: int = 0,
+):
+    """
+    ExternalImputer wrapper around diffusion_lite_torch (numeric-only).
+
+    - Works on numeric columns only (like MIWAE / GAIN-lite wrappers).
+    - Categorical columns are passed through unchanged.
+    """
+    if not _HAS_DIFFUSION_LITE:
+        raise ImportError(
+            "Diffusion-lite imputer requested but external_imputer.diffusion_lite_torch "
+            "or its dependencies are not available."
+        )
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    diff_params = DiffusionParams(
+        T=T,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        hidden_dim=hidden_dim,
+        time_dim=time_dim,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        device=device,
+        seed=seed,
+        n_samples_impute=n_samples_impute,
+    )
+
+    def train_fn(X_df: pd.DataFrame):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            raise ValueError("Diffusion-lite external imputer requires at least one numeric column.")
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        model, params_used, aux = train_diffusion_numeric(
+            X_num,
+            params=diff_params,
+            verbose=True,
+        )
+
+        return {
+            "model": model,
+            "params": params_used,
+            "aux": aux,
+            "num_cols": list(num_cols),
+        }
+
+    def impute_fn(model_bundle, X_df: pd.DataFrame):
+        import numpy as np
+
+        X = X_df.copy()
+        num_cols = model_bundle["num_cols"]
+        if len(num_cols) == 0:
+            return X
+
+        model = model_bundle["model"]
+        params_used = model_bundle["params"]
+        aux = model_bundle["aux"]
+
+        X_num = X[num_cols].to_numpy(dtype=float)
+
+        X_imp = diffusion_impute_numeric(
+            model,
+            params_used,
+            aux,
+            X_num,
+        )
+
+        X[num_cols] = X_imp
+        return X
+
+    return ExternalImputer("Diffusion-lite", train_fn, impute_fn)
 
 class ExternalImputer(BaseImputer):
     """
@@ -1746,6 +2054,24 @@ def build_imputers(
                         "CACTI-lite imputer requested but external_imputer.cacti_lite_torch not available."
                     )
                 imps["CACTI-lite"] = build_cacti_lite_external_imputer()                
+            elif key in ("hivae", "hi-vae"):
+                if not _HAS_HIVAE:
+                    raise ImportError(
+                        "HIVAE imputer requested but external_imputer.hi_vae_torch or its dependencies are not available."
+                    )
+                imps["HIVAE"] = build_hivae_external_imputer()
+            elif key == "mcflow":
+                if not _HAS_MCFLOW:
+                    raise ImportError(
+                        "MCFlow imputer requested but external_imputer.mcflow_torch or its dependencies are not available."
+                    )
+                imps["MCFlow-lite"] = build_mcflow_external_imputer()
+            elif key in ("diffusion-lite", "diffusionlite"):
+                if not _HAS_DIFFUSION_LITE:
+                    raise ImportError(
+                        "Diffusion-lite imputer requested but external_imputer.diffusion_lite_torch or its dependencies are not available."
+                    )
+                imps["Diffusion-lite"] = build_diffusion_lite_external_imputer()
             else:
                 raise ValueError(f"Unknown external imputer requested: {ext_name}")
 
