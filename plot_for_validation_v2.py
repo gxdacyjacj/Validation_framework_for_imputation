@@ -491,5 +491,7 @@ if __name__ == "__main__":
 # %%
 results_dict['Concrete'][0][1].loc[('CatBoost', 'MAR')]
 # %%
-results_dict['Concrete'][0][0].loc[('Mean/Mode', 'MAR')]
+results_dict['Concrete'][0][7]
+# %%
+flat_results['Concrete'][flat_results['Concrete']['criterion']=='criterion_2'].head()
 # %%

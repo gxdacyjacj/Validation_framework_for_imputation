@@ -518,6 +518,40 @@ def _zscore_apply(df: pd.DataFrame, stats: Dict[str, Tuple[float, float]]) -> pd
         out[c] = (out[c] - m) / s
     return out
 
+def _align_train_val_columns(
+    Xtr: pd.DataFrame, Xva: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ensure TRAIN and VAL matrices have exactly the same dummy-encoded columns
+    in the same order.
+
+    - Any column present in TRAIN but missing in VAL is added to VAL and filled with 0.
+    - Any extra column in VAL (not seen in TRAIN) is dropped.
+    - Columns are then reordered so that Xva.columns == Xtr.columns.
+
+    This is needed because one-hot encoding on TRAIN and VAL may create
+    slightly different sets of dummy columns when some categories are
+    missing in one split.
+    """
+    Xtr = Xtr.copy()
+    Xva = Xva.copy()
+
+    # 1) add missing train columns to val as zeros
+    for col in Xtr.columns:
+        if col not in Xva.columns:
+            Xva[col] = 0.0
+
+    # 2) drop extra val columns that were not seen in train
+    extra_cols = [c for c in Xva.columns if c not in Xtr.columns]
+    if extra_cols:
+        Xva.drop(columns=extra_cols, inplace=True)
+
+    # 3) reorder val columns to match train
+    Xva = Xva[Xtr.columns]
+
+    return Xtr, Xva
+
+
 def _compute_feature_error_numeric(y_true, y_pred) -> float:
     """
     Numeric feature error = RMSE, ignoring any non-finite entries
@@ -596,29 +630,50 @@ def _detect_task_type(y: pd.Series) -> str:
         return "classification"
     return "regression"
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Baseline criterion — detailed per-feature outputs (full & missing-only)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 def validate_baseline_direct_error(
     *,
     X_test_complete: pd.DataFrame,    # ground-truth test (fully observed)
     X_test_masked: pd.DataFrame,      # test with introduced NaNs
     imputer_dict: Dict[str, object],  # {name: sklearn-style imputer}
-    fit_data: Tuple[pd.DataFrame, pd.Series],  # (X_train, y_train) for fitting imputers
+    fit_data: Optional[Tuple[pd.DataFrame, pd.Series]] = None,
+    num_cols: Optional[List[str]] = None,
+    zstats: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
-    Return per-imputer dict:
-      {
-        'per_feature_full':           {feature: error},
-        'per_feature_missing_only':   {feature: error},
-        'mean_full':                  float,
-        'mean_missing_only':          float
-      }
-    Numeric features are Z-scored using TRAIN statistics before error calc.
+    Baseline criterion: direct reconstruction error on the TEST set.
+
+    Parameters
+    ----------
+    X_test_complete : fully observed test DataFrame (ground truth)
+    X_test_masked   : same shape as X_test_complete, but with introduced NaNs
+    imputer_dict    : {name: fitted-imputer}
+    fit_data        : (X_train, y_train), used only as a fallback to
+                      compute Z-score stats if num_cols/zstats are not provided.
+    num_cols        : optional list of numeric feature names (from TRAIN)
+    zstats          : optional dict {col: (mean, std)} from TRAIN
+
+    Returns
+    -------
+    out[name] = {
+        "per_feature_full":         {feature: error},
+        "per_feature_missing_only": {feature: error},
+        "mean_full":                float,
+        "mean_missing_only":        float,
+    }
     """
-    X_train, _ = fit_data
-    num_cols, _ = _split_feature_types(X_train)
-    zstats = _zscore_fit(X_train, num_cols)
+    # Prefer explicit stats if given; otherwise fall back to fit_data
+    if num_cols is None or zstats is None:
+        if fit_data is None:
+            raise ValueError(
+                "Either (num_cols, zstats) or fit_data must be provided "
+                "to validate_baseline_direct_error."
+            )
+        X_train, _ = fit_data
+        num_cols, _ = _split_feature_types(X_train)
+        zstats = _zscore_fit(X_train, num_cols)
 
     out = {}
     for name, imputer in imputer_dict.items():
@@ -626,10 +681,10 @@ def validate_baseline_direct_error(
         X_imp = imputer.transform(X_test_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=X_test_masked.columns)
 
-        # NEW: guard against inf/-inf from any imputer
+        # Guard against inf/-inf from any imputer
         X_imp.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # Z-score numeric in both truth & imputed using train stats
+        # Z-score numeric in both truth & imputed using TRAIN stats
         X_true_std = X_test_complete.copy()
         X_imp_std = X_imp.copy()
         X_true_std[num_cols] = _zscore_apply(X_test_complete[num_cols], zstats)
@@ -646,26 +701,39 @@ def validate_baseline_direct_error(
         }
     return out
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Criterion 1 — detailed per-feature outputs (full & missing-only)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 def validate_proxy_complete_case(
     *,
     imputer_dict: Dict[str, object],
-    fit_data: Tuple[pd.DataFrame, pd.Series],  # (X_train, y_train)
     prebuilt_complete_case: pd.DataFrame,
     prebuilt_masked: pd.DataFrame,
+    fit_data: Optional[Tuple[pd.DataFrame, pd.Series]] = None,
+    num_cols: Optional[List[str]] = None,
+    zstats: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
     Criterion 1 (both 1.1 and 1.2), using prebuilt complete-case subset (Xcc)
     and its masked counterpart (Xcc_masked).
-    Returns, per imputer:
-      {
-        'per_feature_full':           {feature: error},
-        'per_feature_missing_only':   {feature: error},
-        'mean_full':                  float,
-        'mean_missing_only':          float
-      }
+
+    Parameters
+    ----------
+    imputer_dict          : {name: fitted imputer}
+    prebuilt_complete_case: Xcc (rows with no missing values before masking)
+    prebuilt_masked       : Xcc_masked (after introducing mask)
+    fit_data              : optional (X_train, y_train) fallback for Z-score stats
+    num_cols              : optional list of numeric feature names from TRAIN
+    zstats                : optional dict {col: (mean, std)} from TRAIN
+
+    Returns
+    -------
+    out[name] = {
+        "per_feature_full":         {feature: error},
+        "per_feature_missing_only": {feature: error},
+        "mean_full":                float,
+        "mean_missing_only":        float,
+    }
     """
     Xcc = prebuilt_complete_case.copy()
     Xcc_masked = prebuilt_masked.copy()
@@ -681,9 +749,16 @@ def validate_proxy_complete_case(
             for name in imputer_dict
         }
 
-    X_train, _ = fit_data
-    num_cols, _ = _split_feature_types(X_train)
-    zstats = _zscore_fit(X_train, num_cols)
+    # Prefer explicit stats if given; otherwise fall back to fit_data
+    if num_cols is None or zstats is None:
+        if fit_data is None:
+            raise ValueError(
+                "Either (num_cols, zstats) or fit_data must be provided "
+                "to validate_proxy_complete_case."
+            )
+        X_train, _ = fit_data
+        num_cols, _ = _split_feature_types(X_train)
+        zstats = _zscore_fit(X_train, num_cols)
 
     out = {}
     for name, imputer in imputer_dict.items():
@@ -691,7 +766,7 @@ def validate_proxy_complete_case(
         X_imp = imputer.transform(Xcc_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=Xcc_masked.columns)
 
-        # NEW: guard against inf/-inf from any imputer
+        # Guard against inf/-inf from any imputer
         X_imp.replace([np.inf, -np.inf], np.nan, inplace=True)
 
         # Z-score numeric using TRAIN stats
@@ -711,9 +786,7 @@ def validate_proxy_complete_case(
         }
     return out
 
-# -----------------------------------------------------------------------------
-# Criterion 2 — per-model errors preserved (plus mean)
-# -----------------------------------------------------------------------------
+
 def validate_downstream_performance(
     *,
     X_train_incomplete: pd.DataFrame,
@@ -722,111 +795,102 @@ def validate_downstream_performance(
     y_val: pd.Series,
     imputer_dict: Dict[str, object],
     model_dict: Optional[Dict[str, object]] = None,
+    num_cols: Optional[List[str]] = None,
+    x_zstats: Optional[Dict[str, Tuple[float, float]]] = None,
+    y_stats: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Criterion 2: downstream predictive performance on a validation set.
 
-    For each imputer:
-      1) Fit imputer on X_train_incomplete
-      2) Impute both TRAIN and VAL
-      3) One-hot encode categoricals
-      4) Align TRAIN/VAL columns (same feature names & order)
-      5) Train each downstream model on TRAIN, evaluate on VAL
+    IMPORTANT:
+    ----------
+    - Imputers in `imputer_dict` are assumed to be ALREADY FITTED
+      (e.g. on Xm_train in run_one_dataset). Here we *only* call
+      `transform`, never `fit` or `fit_transform`.
 
-    Returns
-    -------
-    out : dict
-        out[imputer_name] = {
-            "per_model": {model_name: error, ...},
-            "mean": average_error_over_models
-        }
+    - If `x_zstats` and `num_cols` are provided, numeric features in
+      both TRAIN and VAL are Z-scored using TRAIN stats (from Xm_train).
+
+    - If `y_stats` is provided and the task is regression, y is also
+      Z-scored using TRAIN mean/std, and RMSE is reported in *std-y* units.
     """
     if model_dict is None:
         models = DEFAULT_MODEL_LIST
     else:
         models = model_dict
 
-    # Decide whether we're in regression or classification mode.
-    # In this project all datasets are regression, but keep this for generality.
+    # Decide regression vs classification (your 6 datasets are regression,
+    # but we keep the general path)
     y_tr = pd.Series(y_train).reset_index(drop=True)
     y_va = pd.Series(y_val).reset_index(drop=True)
-    task = "regression"
-    if y_tr.dtype == "O" or len(np.unique(y_tr)) <= 5:
-        # crude heuristic, but fine for internal use
-        task = "classification"
+    task = _detect_task_type(y_tr)
+
+    # ----- scale y (regression) ---------------------------------------------
+    if task == "regression" and y_stats is not None:
+        mean_y, std_y = y_stats
+        if std_y == 0 or not np.isfinite(std_y):
+            # Degenerate: fall back to unscaled y
+            y_tr_scaled = y_tr.astype(float)
+            y_va_scaled = y_va.astype(float)
+        else:
+            y_tr_scaled = (y_tr.astype(float) - mean_y) / std_y
+            y_va_scaled = (y_va.astype(float) - mean_y) / std_y
+    else:
+        y_tr_scaled = y_tr
+        y_va_scaled = y_va
 
     out: Dict[str, Dict[str, float]] = {}
 
     for imp_name, imputer in imputer_dict.items():
-        # 1) Fit imputer on TRAIN, transform both TRAIN and VAL
-        Xtr_imp = imputer.fit_transform(X_train_incomplete.copy())
+        # 1) USE PRE-FITTED IMPUTER: transform only
+        Xtr_imp = imputer.transform(X_train_incomplete.copy())
         Xva_imp = imputer.transform(X_val_incomplete.copy())
-
         Xtr_imp = pd.DataFrame(Xtr_imp, columns=X_train_incomplete.columns)
         Xva_imp = pd.DataFrame(Xva_imp, columns=X_val_incomplete.columns)
 
-        # 2) One-hot encode categoricals for downstream models
+        # 2) Optional: Z-score numeric columns BEFORE dummy encoding
+        if num_cols is not None and x_zstats is not None and len(num_cols) > 0:
+            Xtr_imp[num_cols] = _zscore_apply(Xtr_imp[num_cols], x_zstats)
+            Xva_imp[num_cols] = _zscore_apply(Xva_imp[num_cols], x_zstats)
+
+        # 3) One-hot encode categoricals
         Xtr_num = build_processed(Xtr_imp)
         Xva_num = build_processed(Xva_imp)
 
-        # 3) Align TRAIN and VAL columns so feature names always match
-        #    Some categories may appear only in TRAIN or only in VAL.
-        #    We create the union of columns and fill missing ones with 0.0.
-        cols_union = sorted(set(Xtr_num.columns) | set(Xva_num.columns))
-        Xtr_num = Xtr_num.reindex(columns=cols_union, fill_value=0.0)
-        Xva_num = Xva_num.reindex(columns=cols_union, fill_value=0.0)
+        # 4) Align columns (same dummy set and order)
+        Xtr_num, Xva_num = _align_train_val_columns(Xtr_num, Xva_num)
 
-        # --- NEW: remove inf / -inf, then simple mean-impute any remaining NaNs ---
-        Xtr_num = Xtr_num.replace([np.inf, -np.inf], np.nan)
-        Xva_num = Xva_num.replace([np.inf, -np.inf], np.nan)
-
-        if Xtr_num.isna().any().any() or Xva_num.isna().any().any():
-            col_means = Xtr_num.mean(axis=0)
-            Xtr_num = Xtr_num.fillna(col_means)
-            Xva_num = Xva_num.fillna(col_means)
-
-        # 4) If y_train is (effectively) constant, downstream comparison
-        #    is not meaningful; skip and return NaN for this imputer.
-        if pd.Series(y_tr).nunique() <= 1:
-            out[imp_name] = {
-                "per_model": {},
-                "mean": np.nan,
-            }
-            continue
-
+        # 5) Train/eval downstream models
         per_model: Dict[str, float] = {}
-        errs: List[float] = []
-
-        # 5) Train and evaluate each downstream model
         for mname, model in models.items():
-            # Fresh instance with same hyperparameters
-            mdl = model.__class__(**getattr(model, "get_params", lambda: {})())
-
-            mdl.fit(Xtr_num, y_tr)
-            yhat = mdl.predict(Xva_num)
+            # Fresh copy of the model
+            params = getattr(model, "get_params", lambda: {})()
+            mdl = model.__class__(**params)
 
             if task == "regression":
-                # RMSE on original scale; in your paper you standardise y beforehand
-                err = float(np.sqrt(np.mean((np.asarray(y_va) - np.asarray(yhat)) ** 2)))
+                mdl.fit(Xtr_num, y_tr_scaled)
+                yhat = mdl.predict(Xva_num)
+                err = float(root_mean_squared_error(y_va_scaled, yhat))
             else:
-                # classification: 1 - accuracy
+                mdl.fit(Xtr_num, y_tr)
                 if hasattr(mdl, "predict"):
                     ypred = mdl.predict(Xva_num)
                     err = float(1.0 - accuracy_score(y_va, ypred))
                 else:
-                    # fallback if model returns continuous scores
-                    ypred = (yhat > np.median(yhat)).astype(y_va.dtype)
+                    yhat = mdl.predict_proba(Xva_num)[:, 1]
+                    ypred = (yhat > 0.5).astype(y_va.dtype)
                     err = float(1.0 - accuracy_score(y_va, ypred))
 
             per_model[mname] = err
-            errs.append(err)
 
         out[imp_name] = {
             "per_model": per_model,
-            "mean": float(np.mean(errs)) if errs else np.nan,
+            "mean": _mean_or_nan(per_model),
         }
 
     return out
+
+
 
 
 
@@ -2295,7 +2359,7 @@ def run_one_dataset(
                 combo_seed = BASE_SEED + 1000 * rep + 10 * midx + ridx
                 set_random_seed(combo_seed)
 
-                # ---- split --------------------------------------------------
+                # ---- split: use FULL X, y (oracle), but only Xm_train is "visible"
                 X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(
                     X, y, test_size=0.2, val_size=0.2, random_state=combo_seed
                 )
@@ -2342,13 +2406,28 @@ def run_one_dataset(
                 for imp in imputers.values():
                     imp.fit(Xm_train)
 
+                # ---- TRAIN-BASED SCALERS FROM *MASKED* TRAIN DATA -----------
+                # Only use information that is practically available (Xm_train)
+                num_cols_train, _ = _split_feature_types(Xm_train)
+                x_zstats_train = _zscore_fit(Xm_train, num_cols_train)
+
+                # y scaling (regression output), based on y_train
+                if y_train is not None and pd.api.types.is_numeric_dtype(y_train):
+                    mean_y_train = float(y_train.mean())
+                    std_y_train = float(y_train.std(ddof=0)) or 1.0
+                    y_stats_train = (mean_y_train, std_y_train)
+                else:
+                    y_stats_train = None
+                print(y_stats_train)
 
                 # ---- Baseline (test set; direct error vs truth) --------------
                 baseline_out = validate_baseline_direct_error(
                     X_test_complete=X_test,
                     X_test_masked=Xm_test,
                     imputer_dict=imputers,
-                    fit_data=(Xm_train, y_train),
+                    # scaler based on Xm_train (available knowledge)
+                    num_cols=num_cols_train,
+                    zstats=x_zstats_train,
                 )
 
                 # ---- Criterion 1.1 (MCAR proxy on VAL complete-case) --------
@@ -2370,9 +2449,10 @@ def run_one_dataset(
                     )
                     c11_out = validate_proxy_complete_case(
                         imputer_dict=imputers,
-                        fit_data=(Xm_train, y_train),
                         prebuilt_complete_case=Xcc,
                         prebuilt_masked=Xm_cc,
+                        num_cols=num_cols_train,
+                        zstats=x_zstats_train,
                     )
 
                 # ---- Criterion 1.2 (mechanism-aligned proxy on VAL) ---------
@@ -2399,9 +2479,10 @@ def run_one_dataset(
 
                     c12_out = validate_proxy_complete_case(
                         imputer_dict=imputers,
-                        fit_data=(Xm_train, y_train),
                         prebuilt_complete_case=Xcc,
                         prebuilt_masked=Xm_cc,
+                        num_cols=num_cols_train,
+                        zstats=x_zstats_train,
                     )
 
                 # ---- Criterion 2 (downstream on VAL) -------------------------
@@ -2411,7 +2492,10 @@ def run_one_dataset(
                     X_val_incomplete=Xm_val,
                     y_val=y_val if y_val is not None else pd.Series(np.zeros(len(X_val))),
                     imputer_dict=imputers,
-                    model_dict=model_dict,  # or None -> defaults
+                    model_dict=model_dict,
+                    num_cols=num_cols_train,
+                    x_zstats=x_zstats_train,
+                    y_stats=y_stats_train,
                 )
 
                 results[mask_name][rate][rep] = dict(
@@ -2423,12 +2507,11 @@ def run_one_dataset(
 
                 # Optional external progress callback (e.g. per-block .txt)
                 if progress_callback is not None:
-                    # rep is 0-based internally; send 1..n_repeats for nicer display
                     progress_callback(mask_name, rate, rep + 1, n_repeats)
 
-                # Internal dataset-level progress + checkpoint
                 _update_progress(mask_name, rate, rep)
                 _save_checkpoint()
+
 
     return results
 
