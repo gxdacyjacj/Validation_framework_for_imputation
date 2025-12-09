@@ -5,21 +5,35 @@ Mask: MCAR, Missing rate: 0.10, Repeats: 10
 Timings (seconds):
 Imputer        Time (s)
 ------------------------------
+Mean/Mode   :      1.4 s
+Hot-Deck    :      1.4 s
 KNN         :      1.4 s
-CatBoost    :    148.2 s
-MIWAE       :     72.1 s
-notMIWAE    :     45.6 s
-GAIN        :    128.7 s
-MisGAN-lite :    135.4 s
-CACTI-lite  :   1383.0 s
+LightGBM    :     36.6 s
+CatBoost    :    156.0 s
+PMM         :      5.0 s
+MIWAE       :     74.0 s
+notMIWAE    :     48.3 s
+GAIN        :    139.4 s
+MisGAN-lite :    144.9 s
+CACTI-lite  :   1452.2 s
+HIVAE       :     73.4 s
+MCFlow-lite :     34.8 s
+Diffusion-lite:     13.3 s
 
 Mean BASELINE error (missing-only RMSE):
 Imputer        Mean error
 ------------------------------
+Mean/Mode   :       0.7231
+Hot-Deck    :       0.8646
 KNN         :       0.7057
+LightGBM    :       0.8633
 CatBoost    :       0.7221
-MIWAE       :       0.6823
-notMIWAE    :       0.7029
-GAIN        :       0.8265
-MisGAN-lite :       0.8840
-CACTI-lite  :       0.7329
+PMM         :       1.0548
+MIWAE       :       0.6497
+notMIWAE    :       0.7285
+GAIN        :       0.7918
+MisGAN-lite :       1.0037
+CACTI-lite  :       0.7591
+HIVAE       :       0.6654
+MCFlow-lite :       0.7329
+Diffusion-lite:       0.6814

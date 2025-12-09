@@ -18,9 +18,7 @@ Assumes the following files exist:
     concrete_y.csv
     student_X.csv
     student_y.csv
-    wine_X.csv
-    wine_y.csv
-
+    wine.csv
   composite_1.xlsx
   steel_strength.csv
   Energy_efficiency.csv
@@ -56,11 +54,12 @@ def load_student_performance():
     return X, y.astype(float), "Student"
 
 
-def load_wine_quality():
-    X = pd.read_csv(os.path.join(DATA_DIR, "wine_X.csv"))
-    y = pd.read_csv(os.path.join(DATA_DIR, "wine_y.csv")).iloc[:, 0]
-    X = X.astype(float)
-    y = y.astype(float)
+def load_wine_quality(path=None):
+    if path is None:
+        path = os.path.join(DATA_DIR, "wine.csv")
+    df = pd.read_csv(path)
+    X = df.iloc[:, 1:-1].astype(float)
+    y = df.iloc[:, -1].astype(float)
     return X, y, "Wine"
 
 

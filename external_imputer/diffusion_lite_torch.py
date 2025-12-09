@@ -17,6 +17,25 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+@dataclass
+class DiffusionParams:
+    """
+    Hyperparameters for Diffusion-lite.
+
+    These are what you will tune from validation_v2 via the
+    build_diffusion_lite_external_imputer wrapper.
+    """
+    T: int = 50                  # number of diffusion steps
+    beta_start: float = 1e-4
+    beta_end: float = 0.02
+    hidden_dim: int = 128
+    time_dim: int = 64
+    epochs: int = 500
+    batch_size: int = 128
+    learning_rate: float = 1e-3
+    device: str = "cpu"
+    seed: int = 0
+    n_samples_impute: int = 5    # diffusion runs per row for imputation
 
 # ----------------------------------------------------------------------
 # 1. Time embedding + small denoiser MLP
@@ -125,11 +144,22 @@ class DiffusionSchedule:
 # ----------------------------------------------------------------------
 # 3. Training on numeric data
 # ----------------------------------------------------------------------
-
 def _mean_impute_numpy(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Column-wise mean imputation (for training only)."""
+    """
+    Column-wise mean imputation (for training only), robust to all-NaN columns.
+
+    This mirrors the helper used in mcflow_torch / misgan_lite_torch so that
+    all generative-lite imputers share the same preprocessing.
+    """
     X_imp = X.copy()
     col_means = np.nanmean(X_imp, axis=0)
+
+    # If a column is entirely NaN, nanmean returns NaN. For those columns
+    # we just set the mean to 0.0 as a neutral fallback.
+    nan_cols = np.isnan(col_means)
+    if nan_cols.any():
+        col_means[nan_cols] = 0.0
+
     inds = np.where(np.isnan(X_imp))
     X_imp[inds] = np.take(col_means, inds[1])
     return X_imp, col_means

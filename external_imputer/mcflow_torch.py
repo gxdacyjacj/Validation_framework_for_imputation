@@ -8,6 +8,10 @@
 #
 # It is intended for numeric tabular data with NaNs.
 
+
+
+# mcflow_torch.py  (patched)
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple, Optional
@@ -17,17 +21,27 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+@dataclass
+class MCFlowParams:
+    """
+    Hyperparameters for MCFlow-lite.
 
-# ---------------------------------------------------------------------------
-# 1. RealNVP coupling MLPs
-# ---------------------------------------------------------------------------
+    These are the knobs you can tune from validation_v2 via the
+    ExternalImputer wrapper (e.g. n_coupling_layers, hidden_dim, epochs).
+    """
+    latent_dim: Optional[int] = None  # kept for symmetry with VAE-based models
+    hidden_dim: int = 128
+    n_coupling_layers: int = 6
+    epochs: int = 500
+    batch_size: int = 128
+    learning_rate: float = 1e-3
+    device: str = "cpu"
+    seed: int = 0
+    n_samples_impute: int = 10  # number of z samples per row for imputation
+
 
 class CouplingNN(nn.Module):
-    """Simple MLP used for scale/translate networks in RealNVP.
-
-    Input:  D-dimensional vector (masked x)
-    Output: D-dimensional vector (per-feature scale/shift)
-    """
+    """Simple MLP used for scale/translate networks in RealNVP."""
 
     def __init__(self, dim: int, hidden_dim: int = 128):
         super().__init__()
@@ -43,23 +57,8 @@ class CouplingNN(nn.Module):
         return self.net(x)
 
 
-# ---------------------------------------------------------------------------
-# 2. RealNVP Flow (adapted / simplified from original InterpRealNVP)
-# ---------------------------------------------------------------------------
-
 class RealNVPFlow(nn.Module):
-    """RealNVP-style normalizing flow with a list of binary masks.
-
-    Each coupling layer:
-        z_ = mask * z
-        s = scale_nn(z_)
-        t = translate_nn(z_)
-        z = (1 - mask) * (z * exp(s) + t) + z_
-
-    forward()  : x -> z, returns (z, log_det_jacobian)
-    inverse()  : z -> x
-    log_prob() : negative log-likelihood of x under the flow
-    """
+    """RealNVP-style normalizing flow with a list of binary masks."""
 
     def __init__(
         self,
@@ -71,6 +70,7 @@ class RealNVPFlow(nn.Module):
         super().__init__()
         self.dim = dim
         self.device = device
+        self.scale_limit = 2.0  # <- NEW: limit magnitude of s
 
         # Simple alternating masks: 1010..., 0101..., repeating
         masks = []
@@ -82,7 +82,6 @@ class RealNVPFlow(nn.Module):
                 masks.append(1.0 - base_mask)
         self.masks = nn.Parameter(torch.stack(masks), requires_grad=False)
 
-        # One scale / translate network per coupling layer
         self.scale_nns = nn.ModuleList(
             [CouplingNN(dim, hidden_dim) for _ in range(n_coupling_layers)]
         )
@@ -90,59 +89,52 @@ class RealNVPFlow(nn.Module):
             [CouplingNN(dim, hidden_dim) for _ in range(n_coupling_layers)]
         )
 
-        # Standard Gaussian prior p(z)
         self.register_buffer("prior_mean", torch.zeros(dim))
-        self.register_buffer("prior_logvar", torch.zeros(dim))  # log(1) = 0
-
-    # ----- Flow operations ---------------------------------------------------
+        self.register_buffer("prior_logvar", torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Full transformation x -> z."""
         z = x
         log_det = torch.zeros(x.size(0), device=x.device)
         for i in range(len(self.scale_nns)):
             mask = self.masks[i]
             z_masked = z * mask
-            s = self.scale_nns[i](z_masked) * (1 - mask)
+
+            # robust but less restrictive scale: clip instead of tanh
+            s_raw = self.scale_nns[i](z_masked) * (1 - mask)
+            s = torch.clamp(s_raw, -self.scale_limit, self.scale_limit)
+
             t = self.translate_nns[i](z_masked) * (1 - mask)
             z = z_masked + (1 - mask) * (z * torch.exp(s) + t)
             log_det = log_det + s.sum(dim=1)
         return z, log_det
 
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
-        """Full transformation z -> x."""
         x = z
         for i in reversed(range(len(self.scale_nns))):
             mask = self.masks[i]
             x_masked = x * mask
-            s = self.scale_nns[i](x_masked) * (1 - mask)
+
+            s_raw = self.scale_nns[i](x_masked) * (1 - mask)
+            s = torch.clamp(s_raw, -self.scale_limit, self.scale_limit)
+
             t = self.translate_nns[i](x_masked) * (1 - mask)
             x = x_masked + (1 - mask) * ((x - t) * torch.exp(-s))
         return x
 
-    # ----- Prior & log-prob --------------------------------------------------
-
     def _prior_log_prob(self, z: torch.Tensor) -> torch.Tensor:
-        """Log p(z) under diagonal Gaussian N(0, I)."""
-        # log N(z; 0, I) = -0.5 * (d*log(2π) + ||z||^2)
         return -0.5 * (
-            self.dim * np.log(2 * np.pi) + (z ** 2).sum(dim=1)
+            self.dim * np.log(2 * np.pi) + (z**2).sum(dim=1)
         )
 
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
-        """Return log p(x) under the flow model."""
         z, log_det = self.forward(x)
         log_pz = self._prior_log_prob(z)
         return log_pz + log_det
 
 
-# ---------------------------------------------------------------------------
-# 3. Training / Imputation API (what your ExternalImputer will call)
-# ---------------------------------------------------------------------------
-
 @dataclass
 class MCFlowParams:
-    latent_dim: Optional[int] = None  # kept for symmetry, not used directly
+    latent_dim: Optional[int] = None
     hidden_dim: int = 128
     n_coupling_layers: int = 6
     epochs: int = 500
@@ -150,13 +142,17 @@ class MCFlowParams:
     learning_rate: float = 1e-3
     device: str = "cpu"
     seed: int = 0
-    n_samples_impute: int = 10  # number of z samples per row for imputation
+    n_samples_impute: int = 10
 
 
 def _mean_impute_numpy(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Simple column-wise mean imputation (for training only)."""
+    """Column-wise mean imputation, robust to all-NaN columns."""
     X_imp = X.copy()
     col_means = np.nanmean(X_imp, axis=0)
+    # handle all-NaN columns
+    nan_cols = np.isnan(col_means)
+    if nan_cols.any():
+        col_means[nan_cols] = 0.0
     inds = np.where(np.isnan(X_imp))
     X_imp[inds] = np.take(col_means, inds[1])
     return X_imp, col_means
@@ -167,21 +163,10 @@ def train_mcflow_numeric(
     params: MCFlowParams,
     verbose: bool = False,
 ) -> Tuple[RealNVPFlow, MCFlowParams, dict]:
-    """
-    Train MCFlow-lite on numeric data with NaNs.
-
-    X: (n_samples, n_features) with NaNs as missing.
-    Returns:
-        flow      : trained RealNVPFlow model
-        params    : (same object, possibly with updated device)
-        aux_state : dictionary with column means (for optional later use)
-    """
     torch.manual_seed(params.seed)
     np.random.seed(params.seed)
 
     device = torch.device(params.device)
-
-    # 1) simple mean-imputation to get a complete training set
     X_imp, col_means = _mean_impute_numpy(X)
     n, d = X_imp.shape
 
@@ -196,7 +181,7 @@ def train_mcflow_numeric(
     dataset = TensorDataset(x_tensor)
     loader = DataLoader(dataset, batch_size=params.batch_size, shuffle=True, drop_last=False)
 
-    optimizer = torch.optim.Adam(flow.parameters(), lr=params.learning_rate)
+    opt = torch.optim.Adam(flow.parameters(), lr=params.learning_rate)
 
     for epoch in range(1, params.epochs + 1):
         flow.train()
@@ -204,23 +189,19 @@ def train_mcflow_numeric(
         num_batches = 0
 
         for (batch_x,) in loader:
-            optimizer.zero_grad()
+            opt.zero_grad()
             log_px = flow.log_prob(batch_x)
-            loss = -log_px.mean()  # negative log-likelihood
+            loss = -log_px.mean()
             loss.backward()
-            optimizer.step()
+            opt.step()
 
             total_loss += loss.item()
             num_batches += 1
 
         if verbose and (epoch % max(1, params.epochs // 10) == 0 or epoch == 1):
-            avg_loss = total_loss / max(1, num_batches)
-            print(f"[MCFlow-lite] Epoch {epoch}/{params.epochs}, NLL = {avg_loss:.4f}")
+            print(f"[MCFlow-lite] Epoch {epoch}/{params.epochs}, NLL={total_loss/max(1,num_batches):.4f}")
 
-    aux_state = {
-        "col_means": col_means,
-        "dim": d,
-    }
+    aux_state = {"col_means": col_means, "dim": d}
     return flow, params, aux_state
 
 
@@ -230,16 +211,6 @@ def mcflow_impute_numeric(
     aux_state: dict,
     X_incomplete: np.ndarray,
 ) -> np.ndarray:
-    """
-    Impute missing entries in X_incomplete using a trained RealNVP flow.
-
-    Strategy:
-      - For each row:
-          * sample n_samples_impute times z ~ N(0, I)
-          * x_sample = flow.inverse(z)
-          * clamp observed entries to their true values
-        Return the average of samples for missing entries.
-    """
     device = next(flow.parameters()).device
     flow.eval()
 
@@ -247,22 +218,19 @@ def mcflow_impute_numeric(
     n, d = X.shape
     assert d == aux_state["dim"]
 
-    # Mask of observed entries
-    obs_mask = ~np.isnan(X)  # True if observed
+    obs_mask = ~np.isnan(X)
 
     X_imp_samples = np.zeros((params.n_samples_impute, n, d), dtype=np.float32)
-
     for k in range(params.n_samples_impute):
         with torch.no_grad():
             z = torch.randn(n, d, device=device)
             x_sample = flow.inverse(z).cpu().numpy().astype(np.float32)
 
-        # Clamp observed entries
         x_sample[obs_mask] = X[obs_mask]
+        # optional extra safety: replace inf with nan here
+        x_sample[~np.isfinite(x_sample)] = np.nan
         X_imp_samples[k] = x_sample
 
-    # Average over samples for missing entries
     X_imp_mean = X_imp_samples.mean(axis=0)
-    # Ensure observed entries are exactly original
     X_imp_mean[obs_mask] = X[obs_mask]
     return X_imp_mean

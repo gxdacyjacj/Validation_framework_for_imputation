@@ -49,9 +49,8 @@ def main():
 
     # Build base imputers (including MIWAE)
     imputers = v2.build_imputers(
-        internal_imputer=["KNN","catboost"],
         random_state=v2.BASE_SEED,
-        external_imputer=["miwae","notMIWAE","gain","misgan-lite","cacti-lite"],
+      #  external_imputer=["miwae","notMIWAE","gain","misgan-lite","cacti-lite",'hivae','mcflow','diffusion-lite'],
     )
 
     imputer_names = list(imputers.keys())

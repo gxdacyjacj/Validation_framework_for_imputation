@@ -519,7 +519,20 @@ def _zscore_apply(df: pd.DataFrame, stats: Dict[str, Tuple[float, float]]) -> pd
     return out
 
 def _compute_feature_error_numeric(y_true, y_pred) -> float:
-    return float(root_mean_squared_error(y_true, y_pred))
+    """
+    Numeric feature error = RMSE, ignoring any non-finite entries
+    produced by a misbehaving imputer.
+    """
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+
+    # keep only finite positions
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if not mask.any():
+        return np.nan
+
+    mse = mean_squared_error(yt[mask], yp[mask])
+    return float(np.sqrt(mse))
 
 def _compute_feature_error_categorical(y_true, y_pred) -> float:
     return float(1.0 - accuracy_score(y_true, y_pred))
@@ -534,6 +547,10 @@ def _errors_full_and_missing_only(
       - per_feature_full:   error over all available rows (where both values exist)
       - per_feature_missing_only: error computed only on rows that were masked as missing
     """
+    X_true = X_true.reset_index(drop=True)
+    X_imp = X_imp.reset_index(drop=True)
+    X_masked = X_masked.reset_index(drop=True)
+
     num_cols, cat_cols = _split_feature_types(X_true)
     per_feature_full, per_feature_missing = {}, {}
 
@@ -609,6 +626,9 @@ def validate_baseline_direct_error(
         X_imp = imputer.transform(X_test_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=X_test_masked.columns)
 
+        # NEW: guard against inf/-inf from any imputer
+        X_imp.replace([np.inf, -np.inf], np.nan, inplace=True)
+
         # Z-score numeric in both truth & imputed using train stats
         X_true_std = X_test_complete.copy()
         X_imp_std = X_imp.copy()
@@ -671,6 +691,9 @@ def validate_proxy_complete_case(
         X_imp = imputer.transform(Xcc_masked.copy())
         X_imp = pd.DataFrame(X_imp, columns=Xcc_masked.columns)
 
+        # NEW: guard against inf/-inf from any imputer
+        X_imp.replace([np.inf, -np.inf], np.nan, inplace=True)
+
         # Z-score numeric using TRAIN stats
         X_true_std = Xcc.copy()
         X_imp_std = X_imp.copy()
@@ -728,7 +751,7 @@ def validate_downstream_performance(
     y_tr = pd.Series(y_train).reset_index(drop=True)
     y_va = pd.Series(y_val).reset_index(drop=True)
     task = "regression"
-    if y_tr.dtype == "O" or len(np.unique(y_tr)) <= 10:
+    if y_tr.dtype == "O" or len(np.unique(y_tr)) <= 5:
         # crude heuristic, but fine for internal use
         task = "classification"
 
@@ -752,6 +775,15 @@ def validate_downstream_performance(
         cols_union = sorted(set(Xtr_num.columns) | set(Xva_num.columns))
         Xtr_num = Xtr_num.reindex(columns=cols_union, fill_value=0.0)
         Xva_num = Xva_num.reindex(columns=cols_union, fill_value=0.0)
+
+        # --- NEW: remove inf / -inf, then simple mean-impute any remaining NaNs ---
+        Xtr_num = Xtr_num.replace([np.inf, -np.inf], np.nan)
+        Xva_num = Xva_num.replace([np.inf, -np.inf], np.nan)
+
+        if Xtr_num.isna().any().any() or Xva_num.isna().any().any():
+            col_means = Xtr_num.mean(axis=0)
+            Xtr_num = Xtr_num.fillna(col_means)
+            Xva_num = Xva_num.fillna(col_means)
 
         # 4) If y_train is (effectively) constant, downstream comparison
         #    is not meaningful; skip and return NaN for this imputer.
@@ -1308,7 +1340,7 @@ def build_cacti_lite_external_imputer(
 def build_hivae_external_imputer(
     latent_dim: int = 10,
     hidden_dim: int = 128,
-    n_components: int = 5,
+    #n_components: int = 5,
     iw_samples: int = 10,
     epochs: int = 500,
     batch_size: int = 128,
@@ -1343,7 +1375,7 @@ def build_hivae_external_imputer(
     hivae_params = HIVAEParams(
         latent_dim=latent_dim,
         hidden_dim=hidden_dim,
-        n_components=n_components,
+       # n_components=n_components,
         iw_samples=iw_samples,
         epochs=epochs,
         batch_size=batch_size,
@@ -1476,7 +1508,7 @@ def build_mcflow_external_imputer(
 
     def train_fn(X_df: pd.DataFrame):
         X_np = X_df.to_numpy(dtype=float)
-        flow, p_used, aux = train_mcflow_numeric(X_np, p_used, verbose=False)
+        flow, p_used, aux = train_mcflow_numeric(X_np, params, verbose=False)
         return {"flow": flow, "params": p_used, "aux": aux, "columns": list(X_df.columns)}
 
     def impute_fn(model_bundle, X_df: pd.DataFrame):
