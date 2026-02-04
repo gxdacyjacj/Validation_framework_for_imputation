@@ -658,12 +658,12 @@ def validate_baseline_direct_error(
     zstats: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
-    Baseline criterion: direct reconstruction error on the TEST set.
+    Baseline criterion: direct reconstruction error on the TEST set, updated to use VAL set.
 
     Parameters
     ----------
-    X_test_complete : fully observed test DataFrame (ground truth)
-    X_test_masked   : same shape as X_test_complete, but with introduced NaNs
+    X_test_complete : fully observed test DataFrame (ground truth), updated to use VAL set
+    X_test_masked   : same shape as X_test_complete, but with introduced NaNs, updated to use VAL set
     imputer_dict    : {name: fitted-imputer}
     fit_data        : (X_train, y_train), used only as a fallback to
                       compute Z-score stats if num_cols/zstats are not provided.
@@ -1640,8 +1640,8 @@ def run_one_dataset(
 
                 # ---- Baseline (test set; direct error vs truth) --------------
                 baseline_out = validate_baseline_direct_error(
-                    X_test_complete=X_test,
-                    X_test_masked=Xm_test,
+                    X_test_complete=X_val,     # now baseline is computed on VAL truth
+                    X_test_masked=Xm_val,      # masked VAL
                     imputer_dict=imputers,
                     # scaler based on Xm_train (available knowledge)
                     num_cols=num_cols_train,

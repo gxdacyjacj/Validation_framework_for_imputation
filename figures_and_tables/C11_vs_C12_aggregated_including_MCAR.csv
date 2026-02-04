@@ -1,0 +1,7 @@
+Dataset,Criterion 1.1 wins,Criterion 1.2 wins,Criterion 1.2 win ratio
+Concrete,1752,1895,52.0%
+Composite,1967,1991,50.3%
+Steel,1019,1171,53.5%
+Energy,1308,1512,53.6%
+Student,955,964,50.2%
+Wine,1818,2120,53.8%

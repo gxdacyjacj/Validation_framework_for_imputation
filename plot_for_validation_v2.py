@@ -35,11 +35,17 @@ import pickle
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import pandas as pd
 
+
 from datasets import load_all_datasets
 from validation_v2 import flatten_results
+from matplotlib.collections import LineCollection
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 # =============================================================================
 # Configuration
@@ -437,37 +443,51 @@ def make_figure5(flat_results: Dict[str, pd.DataFrame]) -> plt.Figure:
     sep_x = len(datasets_num) - 0.5
     ax1.axvline(sep_x, color="black", linestyle="-", linewidth=1.2, zorder=1)
 
-    # labels above groups
-    ax1.text(
-        len(datasets_num) - 1.75,
-        1.88,
-        "Numerical",
-        ha="center",
-        fontsize=11,
-        bbox=dict(facecolor="white", edgecolor="none", alpha=1),
+    # --- header bars (axes coordinates) ---
+    xmin, xmax = ax1.get_xlim()
+    to_ax = lambda x: (x - xmin) / (xmax - xmin)  # data-x -> axes fraction
+
+    # numerical spans datasets [0 .. len(datasets_num)-1]
+    x0_num = to_ax(xmin)
+    x1_num = to_ax(sep_x)
+
+    # categorical spans datasets [len(datasets_num) .. end]
+    x0_cat = to_ax(sep_x)
+    x1_cat = to_ax(xmax)
+
+    # bar geometry (in axes coords)
+    bar_y = 1          # top of axes
+    bar_h = 0.055
+    pad = 0.00            # small gap around separator
+
+    # rectangles
+    ax1.add_patch(
+        Rectangle(
+            (x0_num + pad, bar_y), (x1_num - x0_num) - 2 * pad, bar_h,
+            transform=ax1.transAxes, facecolor="gray", edgecolor="black",
+            lw=1, clip_on=False, zorder=10
+        )
     )
-    ax1.text(
-        len(datasets_num) + 0.75,
-        1.88,
-        "Categorical",
-        ha="center",
-        fontsize=11,
-        bbox=dict(facecolor="white", edgecolor="none", alpha=1),
+    ax1.add_patch(
+        Rectangle(
+            (x0_cat + pad, bar_y), (x1_cat - x0_cat) - 2 * pad, bar_h,
+            transform=ax1.transAxes, facecolor="gray", edgecolor="black",
+            lw=1, clip_on=False, zorder=10
+        )
     )
 
-    # arrows
-    ax1.annotate(
-        "",
-        xy=(sep_x - 0.05, 1.85),
-        xytext=(sep_x - 2.55, 1.85),
-        arrowprops=dict(arrowstyle="<-", color="black", lw=1),
+    # white labels centered in each bar
+    ax1.text(
+        (x0_num + x1_num) / 2, bar_y + bar_h / 2, "Numerical",
+        transform=ax1.transAxes, ha="center", va="center",
+        color="white", fontsize=11, zorder=11
     )
-    ax1.annotate(
-        "",
-        xy=(len(all_datasets) - 0.55, 1.85),
-        xytext=(sep_x + 0.05, 1.85),
-        arrowprops=dict(arrowstyle="->", color="black", lw=1),
+    ax1.text(
+        (x0_cat + x1_cat) / 2, bar_y + bar_h / 2, "Categorical",
+        transform=ax1.transAxes, ha="center", va="center",
+        color="white", fontsize=11, zorder=11
     )
+
 
     # legend
     from matplotlib.lines import Line2D
@@ -601,7 +621,7 @@ def prepare_fig6_df_for_dataset(
             if sigma == 0:
                 cleaned = vals
             else:
-                thresh = 3.0 * sigma
+                thresh = 2.0 * sigma
                 cleaned = vals[np.abs(vals - mu) < thresh]
 
             if cleaned.size < vals.size:
@@ -1342,6 +1362,38 @@ def count_winner_flat_all(
         out[ds_name] = count_winner_flat_for_dataset(df_ds, dataset_name=ds_name, n_reps=n_reps)
     return out
 
+import pickle
+
+WINNERS_CACHE_PATH = os.path.join(OUTPUT_ROOT, "winners_all_cache.pkl")
+
+def get_winners_all_cached(
+    flat_results: Dict[str, pd.DataFrame],
+    n_reps: int = 100,
+    cache_path: str = WINNERS_CACHE_PATH,
+    force_recompute: bool = False,
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Load winners_all from cache if present; otherwise compute and save.
+
+    Cached object contains full results for:
+      - Criterion 1.1
+      - Criterion 1.2
+      - Criterion 2
+    for all datasets, masks, rates.
+    """
+    if (not force_recompute) and os.path.isfile(cache_path):
+        with open(cache_path, "rb") as f:
+            winners_all = pickle.load(f)
+        return winners_all
+
+    winners_all = count_winner_flat_all(flat_results, n_reps=n_reps)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(winners_all, f)
+
+    return winners_all
+
 
 CRITERIA_FOR_FIG7 = ["Criterion 1.1", "Criterion 1.2", "Criterion 2"]
 
@@ -1485,6 +1537,577 @@ def plot_figure7_heatmaps(
     return fig, axes
 
 
+
+def draw_region_boundaries(
+    ax,
+    data: np.ndarray,
+    threshold: float = 50,
+    color_lo: str = "green",   # < threshold  (C1 dominates)
+    color_hi: str = "#e53e3e",     # >= threshold (C2 dominates)
+    lw_outer: float = 3.5,
+    lw_split: float = 0.2,
+    eps: float = 0.03,         # offset in data coords (~cell units)
+    zorder: int = 6,
+):
+    """
+    Overlay region boundaries on an imshow heatmap.
+
+    Assumes imshow is called with default pixel-aligned coordinates, i.e.
+    cell (i,j) is centered at (j,i) and its edges are at j±0.5, i±0.5.
+    Works with origin='upper' too (geometry still holds).
+
+    Boundary rules:
+      - Outside boundary: single thick line in the cell's region color
+      - Between different regions: two parallel thinner lines (one per region),
+        offset slightly to each side of the shared edge.
+    """
+    data = np.asarray(data)
+    nrows, ncols = data.shape
+    hi = data >= threshold  # True => C2 wins more (red)
+
+    def c(is_hi: bool) -> str:
+        return color_hi if is_hi else color_lo
+
+    # ---------- outer boundary ----------
+    for i in range(nrows):
+        for j in range(ncols):
+            col = c(bool(hi[i, j]))
+
+            xL, xR = j - 0.5, j + 0.5
+            yT, yB = i - 0.5, i + 0.5
+
+            if j == 0:         # left edge
+                ax.plot([xL, xL], [yT, yB], color=col, lw=lw_outer, zorder=zorder)
+            if j == ncols - 1:  # right edge
+                ax.plot([xR, xR], [yT, yB], color=col, lw=lw_outer, zorder=zorder)
+            if i == 0:         # top edge
+                ax.plot([xL, xR], [yT, yT], color=col, lw=lw_outer, zorder=zorder)
+            if i == nrows - 1:  # bottom edge
+                ax.plot([xL, xR], [yB, yB], color=col, lw=lw_outer, zorder=zorder)
+
+    # ---------- internal boundaries (vertical) ----------
+    # boundary between (i,j) and (i,j+1) lies at x = j+0.5
+    for i in range(nrows):
+        for j in range(ncols - 1):
+            a = bool(hi[i, j])
+            b = bool(hi[i, j + 1])
+            if a == b:
+                continue
+
+            x = j + 0.5
+            yT, yB = i - 0.5, i + 0.5
+
+            # draw two parallel lines, offset to each side of the boundary
+            # side offset: left cell uses x - eps, right cell uses x + eps
+            ax.plot([x - eps, x - eps], [yT, yB], color=c(a), lw=lw_split, zorder=zorder)
+            ax.plot([x + eps, x + eps], [yT, yB], color=c(b), lw=lw_split, zorder=zorder)
+
+    # ---------- internal boundaries (horizontal) ----------
+    # boundary between (i,j) and (i+1,j) lies at y = i+0.5
+    for i in range(nrows - 1):
+        for j in range(ncols):
+            a = bool(hi[i, j])
+            b = bool(hi[i + 1, j])
+            if a == b:
+                continue
+
+            y = i + 0.5
+            xL, xR = j - 0.5, j + 0.5
+
+            # top cell uses y - eps, bottom cell uses y + eps
+            ax.plot([xL, xR], [y - eps, y - eps], color=c(a), lw=lw_split, zorder=zorder)
+            ax.plot([xL, xR], [y + eps, y + eps], color=c(b), lw=lw_split, zorder=zorder)
+
+def add_convex_corner_fixes(segs, hi, eps, c, lw, zorder=9, box_scale=1.0):
+    """
+    Add tiny square-outline connectors at convex corners only.
+    Much more robust than an "L" against AA/capstyle artifacts.
+
+    box_scale=1.0 -> square half-size = eps
+    box_scale=1.2 -> slightly larger connector (often nicer)
+    """
+    hi = np.asarray(hi, dtype=bool)
+    nrows, ncols = hi.shape
+
+    s = eps * float(box_scale)
+
+    for i in range(nrows - 1):
+        for j in range(ncols - 1):
+            xv = j + 0.5
+            yv = i + 0.5
+
+            TL = bool(hi[i, j])
+            TR = bool(hi[i, j + 1])
+            BL = bool(hi[i + 1, j])
+            BR = bool(hi[i + 1, j + 1])
+
+            cnt = TL + TR + BL + BR
+            if cnt not in (1, 3):
+                continue  # no convex corner
+
+            # cnt==1 => True side convex; cnt==3 => False side convex
+            if cnt == 1:
+                side_val = True
+                single = {(0,0): TL, (0,1): TR, (1,0): BL, (1,1): BR}
+            else:
+                side_val = False
+                single = {(0,0): not TL, (0,1): not TR, (1,0): not BL, (1,1): not BR}
+
+            quad = None
+            for (qi, qj), is_single in single.items():
+                if is_single:
+                    quad = (qi, qj)
+                    break
+            if quad is None:
+                continue
+
+            col = c(1-side_val)
+            qi, qj = quad
+
+            # outward directions from the vertex depend on quadrant of the single cell
+            # TL: left+up, TR: right+up, BL: left+down, BR: right+down
+            dx = -1 if qj == 1 else +1
+            dy = -1 if qi == 1 else +1
+
+            # square center is shifted outward from the vertex
+            cx = xv + dx * s
+            cy = yv + dy * s
+
+            segs.append((cx, cy - s, cx, cy + s, col, lw))
+            segs.append((cx - s, cy, cx + s, cy, col, lw))
+
+    return segs
+
+def draw_region_boundaries_strict(
+    ax,
+    hi_mask: np.ndarray,          # bool array (nrows, ncols): True = C2, False = C1
+    color_lo="green",             # C1 boundary color
+    color_hi="red",               # C2 boundary color
+    lw_outer=3.0,                 # outer boundary linewidth
+    lw_split=2.0,                 # internal split linewidth
+    eps=0.035,                    # offset for split lines (in data units)
+    zorder=50,
+    merge=True,                   # merge consecutive segments into long lines
+):
+    """
+    Draw strict region boundaries aligned to cell edges.
+
+    - Outer boundary: one line, colored by the adjacent cell's class.
+    - Inner boundary (between hi/lo): two parallel lines, one on each side,
+      perfectly trimmed to the boundary segment length (no overhang).
+    """
+
+    hi = np.asarray(hi_mask, dtype=bool)
+    nrows, ncols = hi.shape
+
+    def c(v: bool):
+        return color_hi if v else color_lo
+
+    # ---------- helpers to build & (optionally) merge segments ----------
+    # Each segment defined by: (x0, y0, x1, y1, color, lw)
+    segs = []
+
+    # boundary exists where two adjacent cells differ, or cell vs outside
+    # We'll construct per GRID EDGE (not per cell) so no duplicates.
+
+    # ---- OUTER boundary edges ----
+    # Left and right outer vertical edges
+    for i in range(nrows):
+        y0, y1 = i - 0.5, i + 0.5
+
+        # left edge adjacent to (i,0)
+        segs.append((-0.5, y0, -0.5, y1, c(hi[i, 0]), lw_outer))
+        # right edge adjacent to (i,ncols-1)
+        segs.append((ncols - 0.5, y0, ncols - 0.5, y1, c(hi[i, ncols - 1]), lw_outer))
+
+    # Top and bottom outer horizontal edges
+    for j in range(ncols):
+        x0, x1 = j - 0.5, j + 0.5
+
+        # top edge adjacent to (0,j)
+        segs.append((x0, -0.5, x1, -0.5, c(hi[0, j]), lw_outer))
+        # bottom edge adjacent to (nrows-1,j)
+        segs.append((x0, nrows - 0.5, x1, nrows - 0.5, c(hi[nrows - 1, j]), lw_outer))
+
+    # ---- INTERNAL boundaries: vertical (between j and j+1) ----
+    # For each vertical grid line x = j+0.5, add a split segment where hi differs
+    for j in range(ncols - 1):
+        x = j + 0.5
+        for i in range(nrows):
+            a = hi[i, j]
+            b = hi[i, j + 1]
+            if a == b:
+                continue
+            y0, y1 = i - 0.5, i + 0.5
+            # left side line (belongs to cell a)
+            segs.append((x - eps, y0, x - eps, y1, c(a), lw_split))
+            # right side line (belongs to cell b)
+            segs.append((x + eps, y0, x + eps, y1, c(b), lw_split))
+
+    # ---- INTERNAL boundaries: horizontal (between i and i+1) ----
+    # For each horizontal grid line y = i+0.5, add a split segment where hi differs
+    for i in range(nrows - 1):
+        y = i + 0.5
+        for j in range(ncols):
+            a = hi[i, j]
+            b = hi[i + 1, j]
+            if a == b:
+                continue
+            x0, x1 = j - 0.5, j + 0.5
+            # top side line (belongs to cell a) => y - eps
+            segs.append((x0, y - eps, x1, y - eps, c(a), lw_split))
+            # bottom side line (belongs to cell b) => y + eps
+            segs.append((x0, y + eps, x1, y + eps, c(b), lw_split))
+
+    # ---------- OPTIONAL merge: join consecutive collinear segments ----------
+    # This removes tiny seams and makes corners cleaner.
+    if merge:
+        # bucket by (orientation, fixed_coord, color, lw)
+        # vertical: x fixed, horizontal: y fixed
+        buckets = {}
+        for x0, y0, x1, y1, col, lw in segs:
+            if np.isclose(x0, x1):  # vertical
+                key = ("v", round(float(x0), 6), col, float(lw))
+                a, b = sorted([float(y0), float(y1)])
+                buckets.setdefault(key, []).append((a, b))
+            else:  # horizontal
+                key = ("h", round(float(y0), 6), col, float(lw))
+                a, b = sorted([float(x0), float(x1)])
+                buckets.setdefault(key, []).append((a, b))
+
+        merged = []
+        for key, intervals in buckets.items():
+            intervals.sort()
+            cur_a, cur_b = intervals[0]
+            for a, b in intervals[1:]:
+                # contiguous or touching
+                if a <= cur_b + 1e-9:
+                    cur_b = max(cur_b, b)
+                else:
+                    merged.append((key, cur_a, cur_b))
+                    cur_a, cur_b = a, b
+            merged.append((key, cur_a, cur_b))
+
+        segs2 = []
+        for (orient, fixed, col, lw), a, b in merged:
+            if orient == "v":
+                x = fixed
+                segs2.append((x, a, x, b, col, lw))
+            else:
+                y = fixed
+                segs2.append((a, y, b, y, col, lw))
+        segs = segs2
+
+    # ---------- fix convex corners ----------
+    segs = add_convex_corner_fixes(segs, hi, eps=eps, c=c, lw=lw_split)
+
+    # ---------- draw via LineCollection (clean joins/caps) ----------
+    # Group by (color,lw) so LineCollection can be created efficiently
+    groups = {}
+    for x0, y0, x1, y1, col, lw in segs:
+        groups.setdefault((col, lw), []).append([(x0, y0), (x1, y1)])
+
+    for (col, lw), lines in groups.items():
+        lc = LineCollection(
+            lines,
+            colors=[col],
+            linewidths=lw,
+            zorder=zorder,
+            capstyle="butt",     # prevents little protruding caps
+            joinstyle="miter",   # crisp right-angle corners
+        )
+        ax.add_collection(lc)
+
+    return ax
+
+
+def region_boundary_legend_handles(
+    color_lo="green",
+    color_hi="#e53e3e",
+    lw=3,
+):
+    """
+    Create legend handles for region-boundary outlines.
+    """
+    h_lo = Rectangle(
+        (0, 0), 1, 1,
+        fill=False,
+        edgecolor=color_lo,
+        linewidth=lw,
+        label="Criterion 2 performs better"
+    )
+
+    h_hi = Rectangle(
+        (0, 0), 1, 1,
+        fill=False,
+        edgecolor=color_hi,
+        linewidth=lw,
+        label="Criterion 1 performs better"
+    )
+
+    return [h_hi, h_lo]
+
+def plot_figure7_c2_only_2x3(
+    winners_all,
+    dataset_names,
+    n_reps=100,
+    figsize=(14, 7.5),
+    cmap="YlGnBu",
+    aspect=1.1,          # <1 makes heatmap shorter (more rectangular)
+    caption_y=-0.16,      # closer to subplot
+    tick_fs=8,
+    label_fs=9,
+    annot_fs=8,
+):
+    """
+    Plot Criterion 2 wins only, in a 2x3 layout.
+    Each row has its own colorbar (without shrinking the 3rd column).
+    """
+
+    assert len(dataset_names) == 6, "Need 6 datasets for a 2x3 layout."
+
+    masks = VALID_MASK_NAMES
+    rates = MISSING_RATES
+    vmin, vmax = 0, n_reps
+
+    caption_map = {
+        "Concrete": "(a) Concrete compressive strength",
+        "Composite": "(b) Composite material",
+        "Steel": "(c) Steel strength",
+        "Energy": "(d) Energy efficiency",
+        "Student": "(e) Student performance",
+        "Wine": "(f) Wine quality",
+    }
+    MASK_DISPLAY = {
+        "MCAR": "MCAR",
+        "MAR": "MAR",
+        "MNAR": "MNAR",
+        "MCAR_pair": "MCAR_p",
+        "MAR_pair": "MAR_p",
+        "MNAR_pair": "MNAR_p",
+    }
+
+    # ---- GridSpec: 2 rows × (3 plots + 1 thin cbar column) ----
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(
+        2, 4,
+        figure=fig,
+        width_ratios=[1, 1, 1, 0.055],   # last col reserved for cbar
+        wspace=0.2,
+        hspace=0.1
+    )
+
+    axes = np.empty((2, 3), dtype=object)
+    cbar_axes = [fig.add_subplot(gs[0, 3]), fig.add_subplot(gs[1, 3])]
+
+    # store one mappable per row for row-wise colorbar
+    row_mappable = [None, None]
+
+    for row in range(2):
+        for col in range(3):
+            idx = row * 3 + col
+            ds_name = dataset_names[idx]
+
+            ax = fig.add_subplot(gs[row, col])
+            axes[row, col] = ax
+
+            win_df = winners_all[ds_name]["Criterion 2"].reindex(index=masks, columns=rates)
+            win_c1 = n_reps - win_df
+            data = win_c1.values.astype(float)
+
+            im = ax.imshow(
+                data,
+                origin="upper",
+                vmin=vmin,
+                vmax=vmax,
+                cmap=cmap,
+                aspect=aspect,
+                interpolation="nearest",
+            )
+
+            hi_mask = data >= 50
+            draw_region_boundaries_strict(ax, hi_mask, lw_outer=8, lw_split=2.5, eps=0.035)
+
+            # remember one im per row (any of the three works; they share vmin/vmax/cmap)
+            if row_mappable[row] is None:
+                row_mappable[row] = im
+
+            # ---- x axis ----
+            ax.set_xticks(np.arange(len(rates)))
+            ax.set_xticklabels([f"{r:.2f}" for r in rates], fontsize=tick_fs)
+            ax.set_xlabel("Missing ratio", fontsize=label_fs)
+
+            # ---- y axis ----
+            ax.set_yticks(np.arange(len(masks)))
+            if col == 0:
+                ax.set_yticklabels([MASK_DISPLAY[m] for m in masks],
+                                   fontsize=tick_fs, rotation=90,
+                                   va="center", ha="center")
+                ax.set_ylabel("Missing mechanism", fontsize=label_fs)
+            else:
+                ax.set_yticklabels([])
+                ax.tick_params(axis="y", length=0)
+
+            # ---- caption below ----
+            ax.text(
+                0.5, caption_y,
+                caption_map.get(ds_name, ds_name),
+                transform=ax.transAxes,
+                ha="center", va="top",
+                fontsize=label_fs
+            )
+
+            # ---- annotate values with adaptive text color ----
+            for i in range(data.shape[0]):
+                for j in range(data.shape[1]):
+                    val = data[i, j]
+                #    norm_val = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.0
+                #    rgba = im.cmap(norm_val)
+                #    luminance = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+                #    txt_color = "black" if luminance > 0.55 else "white"
+                    txt_color = "white" if val >= 50 else "black"
+                    ax.text(j, i, f"{int(val)}",
+                            ha="center", va="center",
+                            fontsize=annot_fs, color=txt_color)
+
+    # ---- row-wise colorbars (use reserved cbar axes; NO shrinking) ----
+    for row in range(2):
+        cax = cbar_axes[row]
+        cbar = fig.colorbar(row_mappable[row], cax=cax)
+        cbar.set_label(f"Number of Criterion 1 wins (out of {n_reps})", fontsize=label_fs)
+        cbar.ax.tick_params(labelsize=tick_fs)
+
+    # Tighten margins a bit
+    fig.subplots_adjust(left=0.07, right=0.95, bottom=0.08, top=0.97)
+
+    # --- align each row's colorbar height to the row's heatmap axes ---
+    fig.canvas.draw()  # ensure positions are finalized
+
+    for row in range(2):
+        ref_ax = axes[row, 2]      # rightmost heatmap in the row
+        cax = cbar_axes[row]       # the row colorbar axis
+
+        ref_pos = ref_ax.get_position()
+        cax_pos = cax.get_position()
+
+        gap = 0.01   # <<< controls ONLY the space to colorbar (try 0.004–0.008)
+
+        cax.set_position([
+            ref_pos.x1 + gap,      # move cbar closer to 3rd column
+            ref_pos.y0,
+            cax_pos.width,
+            ref_pos.height
+        ])
+    # ---- region-boundary legend (figure-level) ----
+    legend_handles = region_boundary_legend_handles(
+
+    )
+
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=2,
+        frameon=False,
+        fontsize=9,
+        bbox_to_anchor=(0.5, 0.99),
+        handlelength=3.0,
+        handleheight=1.2,
+        columnspacing=2.6,
+    )
+    return fig, axes
+
+
+def build_c11_vs_c12_aggregated_table(
+    winners_all: dict,
+    dataset_names: list,
+    criterion_11: str = "Criterion 1.1",
+    criterion_12: str = "Criterion 1.2",
+    include_mcar: bool = True,
+    mcar_label: str = "MCAR",
+    ratio_as_percent: bool = True,
+    round_ratio: int = 1,
+) -> pd.DataFrame:
+    """
+    Build an aggregated comparison table between Criterion 1.1 and Criterion 1.2.
+
+    Parameters
+    ----------
+    winners_all : dict
+        winners_all[dataset][criterion] -> pd.DataFrame
+        DataFrame index: mask procedures, columns: missing rates,
+        values: number of wins (out of n_reps).
+    dataset_names : list[str]
+        Datasets to include, in order.
+    criterion_11, criterion_12 : str
+        Keys used in winners_all for C1.1 and C1.2.
+    include_mcar : bool
+        If False, drop the MCAR row before aggregation.
+    mcar_label : str
+        The exact row label for MCAR in the winners tables.
+    ratio_as_percent : bool
+        If True, show ratio in percent (0-100). Otherwise in [0, 1].
+    round_ratio : int
+        Decimal places for the ratio column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns:
+        ['Dataset', 'Criterion 1.1 wins', 'Criterion 1.2 wins', 'Criterion 1.2 win ratio']
+    """
+
+    rows = []
+
+    for ds in dataset_names:
+        if ds not in winners_all:
+            raise KeyError(f"Dataset '{ds}' not found in winners_all.")
+
+        if criterion_11 not in winners_all[ds]:
+            raise KeyError(f"'{criterion_11}' not found for dataset '{ds}'.")
+        if criterion_12 not in winners_all[ds]:
+            raise KeyError(f"'{criterion_12}' not found for dataset '{ds}'.")
+
+        df11 = winners_all[ds][criterion_11].copy()
+        df12 = winners_all[ds][criterion_12].copy()
+
+        # Align to common index/columns (safety)
+        common_index = df11.index.intersection(df12.index)
+        common_cols = df11.columns.intersection(df12.columns)
+        df11 = df11.loc[common_index, common_cols]
+        df12 = df12.loc[common_index, common_cols]
+
+        # Optionally exclude MCAR row
+        if not include_mcar and (mcar_label in common_index):
+            df11 = df11.drop(index=mcar_label)
+            df12 = df12.drop(index=mcar_label)
+
+        c11_wins = float(np.nansum(df11.to_numpy(dtype=float)))
+        c12_wins = float(np.nansum(df12.to_numpy(dtype=float)))
+        denom = c11_wins + c12_wins
+
+        if denom <= 0:
+            ratio = np.nan
+        else:
+            ratio = (c12_wins / denom) * (100.0 if ratio_as_percent else 1.0)
+
+        rows.append({
+            "Dataset": ds,
+            "Criterion 1.1 wins": int(round(c11_wins)),
+            "Criterion 1.2 wins": int(round(c12_wins)),
+            "Criterion 1.2 win ratio": (round(ratio, round_ratio) if np.isfinite(ratio) else np.nan),
+        })
+
+    out = pd.DataFrame(rows)
+
+    # Optional: nicer formatting if percent
+    if ratio_as_percent:
+        out["Criterion 1.2 win ratio"] = out["Criterion 1.2 win ratio"].map(
+            lambda x: f"{x:.{round_ratio}f}%" if pd.notna(x) else ""
+        )
+
+    return out
+
+
 # =============================================================================
 # IX. Main entry point
 # =============================================================================
@@ -1500,7 +2123,7 @@ def main() -> None:
 
     # Load flat results
     flat_results = load_all_flat_results(RESULTS_ROOT)
-
+    '''
     # Figure 5
     fig5 = make_figure5(flat_results)
     fig5_path = os.path.join(OUTPUT_ROOT, "Figure5.png")
@@ -1520,9 +2143,9 @@ def main() -> None:
     # Appendix tables for Figure 6
     df_fig6_all = build_fig6_appendix_table(flat_results)
     write_fig6_appendix_csvs(df_fig6_all)
-
+'''
     # Winner counts and Figure 7
-    winners_all = count_winner_flat_all(flat_results, n_reps=100)
+    winners_all = get_winners_all_cached(flat_results, n_reps=100)
 
     fig7a, _ = plot_figure7_heatmaps(
         winners_all,
@@ -1543,19 +2166,33 @@ def main() -> None:
     fig7b_path = os.path.join(OUTPUT_ROOT, "Figure7_Energy_Student_Wine.png")
     fig7b.savefig(fig7b_path, dpi=300, bbox_inches="tight")
     plt.close(fig7b)
+    fig7c, _ = plot_figure7_c2_only_2x3(
+        winners_all,
+        dataset_names=["Concrete", "Composite", "Steel", "Energy", "Student", "Wine"],
+        n_reps=100,
+        figsize=(10, 8),
+    )
+    fig7_path = os.path.join(OUTPUT_ROOT, "Figure7_C2_only_3x2.png")
+    fig7c.savefig(fig7_path, dpi=300, bbox_inches="tight")
+    plt.close(fig7c)
+'''
+    tbl_inc = build_c11_vs_c12_aggregated_table(
+        winners_all,
+        dataset_names=["Concrete","Composite","Steel","Energy","Student","Wine"],
+        include_mcar=True,
+    )
+    tbl_inc_path = os.path.join(OUTPUT_ROOT, "C11_vs_C12_aggregated_including_MCAR.csv")
+    tbl_inc.to_csv(tbl_inc_path, index=False)
 
-
+    tbl_exc = build_c11_vs_c12_aggregated_table(
+        winners_all,
+        dataset_names=["Concrete","Composite","Steel","Energy","Student","Wine"],
+        include_mcar=False,
+    )
+    tbl_exc_path = os.path.join(OUTPUT_ROOT, "C11_vs_C12_aggregated_excluding_MCAR.csv")
+    tbl_exc.to_csv(tbl_exc_path, index=False)
+'''
 if __name__ == "__main__":
     main()
-#%%
-import pickle
-import pickle
-test = {}
-with open("dataset4_Energy_mask-MAR_pair_rate-5pct.pkl", "rb") as f:
-    test = pickle.load(f)
-# %%
-# Access the nested results dictionary and convert to DataFrame for filtering
-from validation_v2 import flatten_results
-df_check = flatten_results(test['results'])
-df_check[df_check['rep'] == 0]
+
 # %%
